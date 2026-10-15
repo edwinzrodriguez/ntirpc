@@ -400,6 +400,13 @@ struct svc_req {
 	/* blkin tracing */
 	struct blkin_trace bl_trace;
 #endif
+	/*
+	 * Monotonic start time for this request, copied from the transport's
+	 * recv.ts at svc_request() (set in task_recv before SVC_RECV).
+	 * Used by upper layers for end-to-end latency; do not reuse recv.ts
+	 * across the request lifetime (it tracks xprt idle/activity).
+	 */
+	struct timespec rq_stime;
 	uint32_t rq_refcnt;
 };
 
