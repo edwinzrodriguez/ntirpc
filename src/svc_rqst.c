@@ -1338,6 +1338,9 @@ enum xprt_stat svc_request(SVCXPRT *xprt, XDR *xdrs)
 	struct svc_req *req = __svc_params->alloc_cb(xprt, xdrs);
 	struct rpc_dplx_rec *rpc_dplx_rec = REC_XPRT(xprt);
 
+	/* Snapshot recv.ts before decode; recv.ts is also xprt idle activity */
+	req->rq_stime = rpc_dplx_rec->recv.ts;
+
 	/* Track the request we are processing */
 	rpc_dplx_rec->svc_req = req;
 
