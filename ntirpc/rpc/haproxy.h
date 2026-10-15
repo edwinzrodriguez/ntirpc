@@ -33,6 +33,12 @@
 #ifndef _NTIRPC_RPC_HAPROXY_H
 #define _NTIRPC_RPC_HAPROXY_H
 
+#ifdef __cplusplus
+/* static_assert is a keyword in C++11 */
+#else
+#include <assert.h>  /* provides static_assert in C11 */
+#endif
+
 /* proxy protocol v2 definitions */
 #define PP2_SIGNATURE        "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A"
 #define PP2_SIG_UINT32       0x0d0a0d0a
@@ -122,7 +128,7 @@ struct proxy_header_addr_ip4_part { /* for TCP/UDP over IPv4, len = 12 */
 	uint16_t src_port;
 	uint16_t dst_port;
 };
-_Static_assert(
+static_assert(
 	sizeof(struct proxy_header_addr_ip4_part) == PP2_ADDR_LEN_INET,
 	"proxy_header_addr_ip4_part size is not equal to PP2_ADDR_LEN_INET");
 
@@ -132,7 +138,7 @@ struct proxy_header_addr_ip6_part { /* for TCP/UDP over IPv6, len = 36 */
 	uint16_t src_port;
 	uint16_t dst_port;
 };
-_Static_assert(
+static_assert(
 	sizeof(struct proxy_header_addr_ip6_part) == PP2_ADDR_LEN_INET6,
 	"proxy_header_addr_ip6_part size is not equal to PP2_ADDR_LEN_INET6");
 
