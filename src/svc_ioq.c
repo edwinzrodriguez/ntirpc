@@ -69,6 +69,21 @@
 #define LAST_FRAG_XDR_UNITS ((LAST_FRAG - 1) & ~(BYTES_PER_XDR_UNIT - 1))
 #define MAXALLOCA (256)
 
+void
+svc_ioq_reply_done(struct xdr_ioq *xioq, int status)
+{
+	svc_reply_done_fun_t cb;
+
+	if (!xioq || !xioq->ioq_stats_valid)
+		return;
+
+	xioq->ioq_stats_valid = false;
+	cb = __svc_params->reply_done_cb;
+	if (cb)
+		cb(&xioq->ioq_rq_stime, &xioq->ioq_reply_time,
+		   xioq->ioq_stats_opcode, status);
+}
+
 /* Returns 0 on success, EWOULDBLOCK if would block, <0 on error */
 static inline int
 svc_ioq_flushv(SVCXPRT *xprt, struct xdr_ioq *xioq)
@@ -377,6 +392,7 @@ void svc_ioq_write(SVCXPRT *xprt)
 			XPRT_AUTO_TRACEPOINT(xprt, destroy_xprt,
 				TRACE_INFO, "IO failed, destroy xprt.");
 			mutex_unlock(&rec->writeq.qmutex);
+			/* Remaining queued replies are completed in writeq clear */
 			break;
 		} else if (rc == EWOULDBLOCK){
 			__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
@@ -429,6 +445,7 @@ void svc_ioq_write(SVCXPRT *xprt)
 		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
 			"%s: %p fd %d About to release",
 			__func__, xprt, xprt->xp_fd);
+		svc_ioq_reply_done(xioq, 0);
 		SVC_RELEASE(xprt, SVC_RELEASE_FLAG_NONE);
 		XDR_DESTROY(xioq->xdrs);
 	}
@@ -461,6 +478,7 @@ static bool add_ioq_to_write_queue(SVCXPRT *xprt, struct xdr_ioq *xioq) {
 		XPRT_UNIQUE_AUTO_TRACEPOINT(xprt, mutex_unlock,
 			TRACE_DEBUG, "Unlocking mutex");
 		mutex_unlock(&rec->writeq.qmutex);
+		svc_ioq_reply_done(xioq, ECONNABORTED);
 		XDR_DESTROY(xioq->xdrs);
 		return false;
 	}
