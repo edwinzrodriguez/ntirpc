@@ -1234,6 +1234,7 @@ static void clear_requests(struct rpc_dplx_rec *rec) {
 
 		release_count++;
 		TAILQ_REMOVE(&rec->writeq.qh, have, q);
+		svc_ioq_reply_done(xioq, ECONNABORTED);
 		XDR_DESTROY(xioq->xdrs);
 		have = TAILQ_FIRST(&rec->writeq.qh);
 	}
@@ -1340,6 +1341,7 @@ enum xprt_stat svc_request(SVCXPRT *xprt, XDR *xdrs)
 
 	/* Snapshot recv.ts before decode; recv.ts is also xprt idle activity */
 	req->rq_stime = rpc_dplx_rec->recv.ts;
+	req->rq_stats_opcode = -1;
 
 	/* Track the request we are processing */
 	rpc_dplx_rec->svc_req = req;

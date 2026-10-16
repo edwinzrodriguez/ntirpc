@@ -32,5 +32,7 @@
 void svc_ioq_write(SVCXPRT *);
 void svc_ioq_write_now(SVCXPRT *, struct xdr_ioq *);
 void svc_ioq_write_submit(SVCXPRT *, struct xdr_ioq *);
+/* Fire reply_done_cb once for this xioq (clears ioq_stats_valid) */
+void svc_ioq_reply_done(struct xdr_ioq *xioq, int status);
 
 #endif				/* SVC_IOQ_H */

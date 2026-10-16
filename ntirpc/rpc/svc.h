@@ -134,11 +134,21 @@ typedef enum xprt_stat (*svc_xprt_fun_t) (SVCXPRT *);
 typedef void (*svc_xprt_void_fun_t) (SVCXPRT *);
 typedef struct svc_req *(*svc_xprt_alloc_fun_t) (SVCXPRT *, XDR *);
 typedef void (*svc_xprt_free_fun_t) (struct svc_req *, enum xprt_stat);
+/*
+ * Called when a reply has been fully sent (or abandoned).
+ * @stime / @reply_time are monotonic stamps from the request (T0 / T3).
+ * @opcode is the upper-layer stats opcode (-1 if unset).
+ * @status is 0 on success, errno-style on failure/destroy.
+ */
+typedef void (*svc_reply_done_fun_t)(const struct timespec *stime,
+				     const struct timespec *reply_time,
+				     int opcode, int status);
 
 typedef struct svc_init_params {
 	svc_xprt_fun_t disconnect_cb;	/* no dynamic update */
 	svc_xprt_alloc_fun_t alloc_cb;	/* no dynamic update */
 	svc_xprt_free_fun_t free_cb;	/* no dynamic update */
+	svc_reply_done_fun_t reply_done_cb;	/* no dynamic update */
 
 	u_long flags;			/* no dynamic update */
 	u_int max_connections;		/* dynamnic, xprts */
@@ -441,6 +451,10 @@ struct svc_req {
 	 * across the request lifetime (it tracks xprt idle/activity).
 	 */
 	struct timespec rq_stime;
+	/* Monotonic time when reply send begins (set by upper layer, T3) */
+	struct timespec rq_reply_time;
+	/* Terminal NFSv4 opcode for reply-done stats; -1 if unset */
+	int32_t rq_stats_opcode;
 	uint32_t rq_refcnt;
 };
 

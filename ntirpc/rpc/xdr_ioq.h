@@ -28,6 +28,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <time.h>
 #include <misc/opr.h>
 #include <misc/queue.h>
 #include <rpc/pool_queue.h>
@@ -128,6 +129,15 @@ struct xdr_ioq {
 	uint32_t write_start; /* Position to start write at */
 	int frag_hdr_bytes_sent; /* Indicates a fragment header has been sent */
 	bool has_blocked;
+
+	/*
+	 * Reply timing cookie copied from svc_req before async send.
+	 * Do not retain pointers to svc_req / nfs_request (freed earlier).
+	 */
+	struct timespec ioq_rq_stime;
+	struct timespec ioq_reply_time;
+	int32_t ioq_stats_opcode;
+	bool ioq_stats_valid;
 
 #ifdef USE_RPC_RDMA
 	bool rdma_ioq;
