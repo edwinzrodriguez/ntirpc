@@ -150,6 +150,7 @@ svc_init(svc_init_params *params)
 	__svc_params->disconnect_cb = params->disconnect_cb;
 	__svc_params->alloc_cb = params->alloc_cb;
 	__svc_params->free_cb = params->free_cb;
+	__svc_params->reply_done_cb = params->reply_done_cb;
 
 	__svc_params->max_connections =
 	    (params->max_connections) ? params->max_connections : FD_SETSIZE;
