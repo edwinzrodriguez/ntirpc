@@ -448,13 +448,14 @@ struct svc_req {
 	struct blkin_trace bl_trace;
 #endif
 	/*
-	 * Monotonic start time for this request, copied from the transport's
-	 * recv.ts at svc_request() (set in task_recv before SVC_RECV).
-	 * Used by upper layers for end-to-end latency; do not reuse recv.ts
-	 * across the request lifetime (it tracks xprt idle/activity).
+	 * Fine CLOCK_MONOTONIC start for this request, copied from the
+	 * transport's recv.ts at svc_request() (set in task_recv before
+	 * SVC_RECV). Same clock as Ganesha now_mono() so FULLV4/e2e latency
+	 * is not inflated by COARSE/FAST resolution. Do not reuse recv.ts
+	 * across the request lifetime (it also tracks xprt idle/activity).
 	 */
 	struct timespec rq_stime;
-	/* Monotonic time when reply send begins (set by upper layer, T3) */
+	/* Fine CLOCK_MONOTONIC when reply send begins (set by upper layer, T3) */
 	struct timespec rq_reply_time;
 	/* Terminal NFSv4 opcode for reply-done stats; -1 if unset */
 	int32_t rq_stats_opcode;
