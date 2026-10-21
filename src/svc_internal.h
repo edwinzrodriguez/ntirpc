@@ -66,6 +66,7 @@ struct svc_params {
 	svc_xprt_alloc_fun_t alloc_cb;
 	svc_xprt_free_fun_t free_cb;
 	svc_reply_done_fun_t reply_done_cb;
+	bool stage_timing;
 
 	struct {
 		int ctx_hash_partitions;
