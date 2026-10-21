@@ -49,13 +49,24 @@
 #include "clnt_internal.h"
 #include "svc_internal.h"
 
-/* Fine CLOCK_MONOTONIC ns for IO stage timing (not COARSE). */
+/*
+ * Fine CLOCK_MONOTONIC for request-start / stage timing.
+ * Must match Ganesha now_mono() — do not use CLOCK_MONOTONIC_COARSE
+ * (CLOCK_MONOTONIC_FAST on Linux): mixing coarse start with fine end
+ * inflates FULLV4/e2e latency by up to ~1ms on short ops.
+ */
+static inline void
+svc_now_mono(struct timespec *ts)
+{
+	(void)clock_gettime(CLOCK_MONOTONIC, ts);
+}
+
 static inline uint64_t
 svc_stage_now_ns(void)
 {
 	struct timespec ts;
 
-	(void)clock_gettime(CLOCK_MONOTONIC, &ts);
+	svc_now_mono(&ts);
 	return ((uint64_t)ts.tv_sec * 1000000000ULL) + (uint64_t)ts.tv_nsec;
 }
 #include "svc_xprt.h"
@@ -1312,7 +1323,8 @@ svc_rqst_xprt_task_recv(struct work_pool_entry *wpe)
 		/* (idempotent) xp_flags and xp_refcnt are set atomic.
 		 * xp_refcnt need more than 1 (this task).
 		 */
-		(void)clock_gettime(CLOCK_MONOTONIC_FAST, &rec->recv.ts);
+		/* Fine mono: feeds rq_stime for e2e latency (see svc_now_mono). */
+		svc_now_mono(&rec->recv.ts);
 		(void)SVC_RECV(&rec->xprt);
 	}
 
@@ -1327,7 +1339,10 @@ enum xprt_stat svc_request(SVCXPRT *xprt, XDR *xdrs)
 	struct rpc_dplx_rec *rpc_dplx_rec = REC_XPRT(xprt);
 	struct xdr_ioq *ioq = &rpc_dplx_rec->ioq;
 
-	/* Snapshot recv.ts before decode; recv.ts is also xprt idle activity */
+	/*
+	 * Snapshot recv.ts before decode (fine CLOCK_MONOTONIC from task_recv).
+	 * recv.ts also tracks xprt idle activity (second-scale; fine clock OK).
+	 */
 	req->rq_stime = rpc_dplx_rec->recv.ts;
 	req->rq_stats_opcode = -1;
 
