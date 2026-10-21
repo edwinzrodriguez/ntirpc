@@ -173,6 +173,8 @@ svc_init(svc_init_params *params)
 		__svc_params->reply_done_cb = params->reply_done_cb;
 	}
 
+	__svc_params->stage_timing = params->stage_timing;
+
 	__svc_params->max_connections =
 	    (params->max_connections) ? params->max_connections : FD_SETSIZE;
 
@@ -287,6 +289,11 @@ svc_init(svc_init_params *params)
 	}
 #endif
 	return true;
+}
+
+void svc_set_stage_timing(bool enable)
+{
+	__svc_params->stage_timing = enable;
 }
 
 /* ***************  SVCXPRT related stuff **************** */

@@ -84,7 +84,7 @@ svc_ioq_reply_done(struct xdr_ioq *xioq, int status)
 	cb = __svc_params->reply_done_cb;
 	if (cb)
 		cb(&xioq->ioq_rq_stime, &xioq->ioq_reply_time,
-		   xioq->ioq_stats_opcode, status);
+		   xioq->ioq_stats_opcode, status, xioq->ioq_stage_t10_ns);
 }
 
 /* Returns 0 on success, EWOULDBLOCK if would block, <0 on error */
