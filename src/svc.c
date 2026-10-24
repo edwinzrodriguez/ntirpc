@@ -174,6 +174,15 @@ svc_init(svc_init_params *params)
 	}
 
 	__svc_params->stage_timing = params->stage_timing;
+	__svc_params->socket_zerocopy = params->socket_zerocopy;
+	__svc_params->socket_zerocopy_threshold =
+	    params->socket_zerocopy_threshold
+		    ? params->socket_zerocopy_threshold
+		    : (16 * 1024);
+	__svc_params->socket_zerocopy_max_pending =
+	    params->socket_zerocopy_max_pending
+		    ? params->socket_zerocopy_max_pending
+		    : (64 * 1024 * 1024);
 
 	__svc_params->max_connections =
 	    (params->max_connections) ? params->max_connections : FD_SETSIZE;
@@ -294,6 +303,11 @@ svc_init(svc_init_params *params)
 void svc_set_stage_timing(bool enable)
 {
 	__svc_params->stage_timing = enable;
+}
+
+void svc_set_socket_zerocopy(bool enable)
+{
+	__svc_params->socket_zerocopy = enable;
 }
 
 /* ***************  SVCXPRT related stuff **************** */

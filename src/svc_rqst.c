@@ -72,6 +72,7 @@ svc_stage_now_ns(void)
 #include "svc_xprt.h"
 #include <rpc/svc_auth.h>
 #include "svc_ioq.h"
+#include "svc_zc.h"
 
 #ifdef USE_RPC_RDMA
 #include "rpc_rdma.h"
@@ -1296,6 +1297,7 @@ svc_rqst_xprt_unregister(SVCXPRT *xprt, uint32_t flags)
 	}
 	svc_rqst_unreg(rec, sr_rec);
 	clear_requests(rec);
+	svc_zc_clear(rec);
 }
 
 #if defined(USE_RPC_RDMA)
@@ -1597,15 +1599,25 @@ svc_rqst_epoll_event(struct svc_rqst_rec *sr_rec, struct epoll_event *ev)
 	rec = REC_XPRT(xprt);
 
 	__warnx(TIRPC_DEBUG_FLAG_SVC_RQST,
-		"%s: event %p %08x%s%s rpc_dplx_rec %p (sr_rec %p)",
+		"%s: event %p %08x%s%s%s rpc_dplx_rec %p (sr_rec %p)",
 		__func__, ev, ev->events,
 		ev->events & EPOLLIN ? " RECV" : "",
 		ev->events & EPOLLOUT ? " SEND" : "",
+		ev->events & EPOLLERR ? " ERR" : "",
 		rec, sr_rec);
 
 #if USE_TLS
 tls_dpr:
 #endif
+	/*
+	 * MSG_ZEROCOPY completions surface as EPOLLERR (error queue).
+	 * Drain before handling IN/OUT. EPOLLONESHOT is consumed by any
+	 * delivered event — including ERR-only — so interest must be
+	 * re-armed afterward when no RECV/SEND task will do it.
+	 */
+	if (ev->events & EPOLLERR)
+		svc_zc_drain(&rec->xprt, false);
+
 	if (ev->events & EPOLLIN) {
 		/* This is a RECV event */
 		ev_flag = SVC_XPRT_FLAG_ADDED_RECV;
@@ -1616,6 +1628,29 @@ tls_dpr:
 		ev_flag = SVC_XPRT_FLAG_ADDED_SEND;
 		ioq = rec->ev_u.epoll.xioq_send;
 		fun = svc_rqst_xprt_task_send;
+	} else if (ev->events & EPOLLERR) {
+		/*
+		 * ZC completion only. EPOLLONESHOT already disarmed the fd,
+		 * but xp_flags may still show ADDED_RECV (cleared only on
+		 * the RECV path). svc_rqst_rearm_events treats
+		 * "flag already set" as failure — clear first if we still
+		 * own the arm, otherwise a RECV task is in flight and will
+		 * rearm itself.
+		 */
+		xp_flags = atomic_postclear_uint16_t_bits(
+			&rec->xprt.xp_flags, SVC_XPRT_FLAG_ADDED_RECV);
+		if (xp_flags & SVC_XPRT_FLAG_ADDED_RECV) {
+			if (unlikely(svc_rqst_rearm_events(
+					&rec->xprt,
+					SVC_XPRT_FLAG_ADDED_RECV))) {
+				__warnx(TIRPC_DEBUG_FLAG_ERROR,
+					"%s: %p fd %d ZC EPOLLERR rearm failed",
+					__func__, &rec->xprt,
+					rec->xprt.xp_fd);
+			}
+		}
+		SVC_RELEASE(&rec->xprt, SVC_RELEASE_FLAG_NONE);
+		return NULL;
 	} else {
 		XPRT_UNIQUE_AUTO_TRACEPOINT(&rec->xprt, epoll_event, TRACE_INFO,
 			"Unhandled epoll event. ev_flag: {}", ev->events);

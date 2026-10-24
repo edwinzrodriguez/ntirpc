@@ -152,6 +152,19 @@ typedef struct svc_init_params {
 	svc_reply_done_fun_t reply_done_cb;	/* no dynamic update */
 	/** When true, stamp fine CLOCK_MONOTONIC stage times on ioq/svc_req */
 	bool stage_timing;		/* dynamic */
+	/**
+	 * When true (and kernel supports it), enable SO_ZEROCOPY on accepted
+	 * TCP sockets and use MSG_ZEROCOPY for large sends. Completions arrive
+	 * via the socket error queue (EPOLLERR / MSG_ERRQUEUE).
+	 */
+	bool socket_zerocopy;		/* dynamic */
+	/** Min send size (bytes) to attempt MSG_ZEROCOPY. 0 = default 16KiB. */
+	u_int socket_zerocopy_threshold;	/* dynamic */
+	/**
+	 * Cap on outstanding unsent/uncompleted ZC payload bytes per xprt.
+	 * 0 = default 64MiB. Over cap falls back to classic sendmsg.
+	 */
+	u_int socket_zerocopy_max_pending;	/* dynamic */
 
 	u_long flags;			/* no dynamic update */
 	u_int max_connections;		/* dynamnic, xprts */
@@ -197,6 +210,8 @@ typedef struct svc_init_params {
 #define SVC_XPRT_FLAG_IOQ_WRITING	0x0800	/* xprt is used by svc_ioq_write */
 #define SVC_XPRT_FLAG_NO_SET		0x1000  /* do not register with rpcbind */
 #define SVC_XPRT_FLAG_TLS_MORE_DATA_AVAILABLE 0x2000 /* TLS specific more data available on xprt to read */
+/** SO_ZEROCOPY was successfully set on this TCP socket */
+#define SVC_XPRT_FLAG_SO_ZEROCOPY	0x4000
 
 #define SVC_XPRT_FLAG_DESTROYED (SVC_XPRT_FLAG_DESTROYING \
 				| SVC_XPRT_FLAG_RELEASING)
@@ -483,6 +498,8 @@ extern void svc_resume(struct svc_req *req);
 
 /** Enable/disable fine-grained IO stage stamps in ntirpc (runtime). */
 extern void svc_set_stage_timing(bool enable);
+/** Enable/disable socket TX zerocopy at runtime (affects new accepts + sends). */
+extern void svc_set_socket_zerocopy(bool enable);
 
 extern void svc_rqst_qos_suspend_socket(struct svc_xprt *xprt);
 
