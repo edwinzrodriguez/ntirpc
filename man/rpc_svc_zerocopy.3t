@@ -1,0 +1,158 @@
+.\" Copyright (c) 2026 NFS-Ganesha / ntirpc contributors
+.\" SPDX-License-Identifier: BSD-3-Clause
+.Dd October 24, 2026
+.Dt RPC_SVC_ZEROCOPY 3
+.Os ntirpc
+.Sh NAME
+.Nm rpc_svc_zerocopy ,
+.Nm svc_init ,
+.Nm svc_set_socket_zerocopy
+.Nd TCP socket transmit zerocopy for RPC replies
+.Sh LIBRARY
+.Lb libntirpc
+.Sh SYNOPSIS
+.In rpc/rpc.h
+.Ft bool
+.Fn svc_init "svc_init_params *params"
+.Ft void
+.Fn svc_set_socket_zerocopy "bool enable"
+.Sh DESCRIPTION
+On Linux, ntirpc can send large connection-oriented (TCP) RPC replies with
+.Dv MSG_ZEROCOPY
+after
+.Dv SO_ZEROCOPY
+is set on the accepted socket.
+This avoids copying userspace payload into kernel skbuffs for eligible sends.
+Buffers remain pinned until the kernel posts a completion on the socket
+.Em error queue
+.Pq Dv MSG_ERRQUEUE ,
+signaled as
+.Dv EPOLLERR
+/
+.Dv POLLERR
+(not ordinary
+.Dv EPOLLIN
+/
+.Dv EPOLLOUT ) .
+ntirpc drains completions, then destroys the reply XDR / gifted
+.Pq Dv UIO_FLAG_REFER
+buffers.
+.Pp
+The feature is optional, off by default, and requires kernel/glibc support
+for
+.Dv SO_ZEROCOPY
+and
+.Dv MSG_ZEROCOPY
+.Pq CMake
+.Dv HAVE_SO_ZEROCOPY .
+If
+.Fn setsockopt
+fails, the transport falls back to classic
+.Fn sendmsg .
+.Ss Enabling via svc_init
+Pass fields in
+.Vt svc_init_params
+before
+.Fn svc_init :
+.Bl -tag -width socket_zerocopy_max_pending
+.It Va socket_zerocopy
+When
+.Dv true ,
+enable
+.Dv SO_ZEROCOPY
+on newly accepted TCP sockets and allow
+.Dv MSG_ZEROCOPY
+for large sends.
+Default:
+.Dv false .
+.It Va socket_zerocopy_threshold
+Minimum send size in bytes to attempt
+.Dv MSG_ZEROCOPY .
+Zero selects the ntirpc default (16 KiB).
+Ordinary (non-refer) payloads use twice this threshold.
+.It Va socket_zerocopy_max_pending
+Cap on outstanding uncompleted zerocopy payload bytes per transport.
+Zero selects the ntirpc default (64 MiB).
+Sends that would exceed the cap use classic
+.Fn sendmsg .
+.El
+.Pp
+Example:
+.Bd -literal -offset indent
+svc_init_params p = { 0 };
+p.flags = SVC_INIT_EPOLL;
+p.socket_zerocopy = true;
+p.socket_zerocopy_threshold = 16384;      /* or 0 for default */
+p.socket_zerocopy_max_pending = 0;        /* default 64MiB */
+if (!svc_init(&p))
+	err(1, "svc_init");
+.Ed
+.Ss Runtime toggle
+.Fn svc_set_socket_zerocopy
+enables or disables the feature after init.
+It affects subsequent eligibility checks and new accepts that call
+.Fn svc_zc_try_enable ;
+sockets that already have
+.Dv SVC_XPRT_FLAG_SO_ZEROCOPY
+set keep the socket option until closed.
+.Ss Behavior notes
+.Bl -bullet
+.It
+Only TCP service transports
+.Pq see Fn svc_vc_create
+participate; datagram and raw transports do not.
+.It
+.Dv ENOBUFS
+/
+.Dv EOPNOTSUPP
+on a zerocopy send fall back to a classic send for that chunk.
+.It
+Loopback traffic typically completes with
+.Dv SO_EE_CODE_ZEROCOPY_COPIED
+(deferred copy); the API and buffer lifetime rules are the same.
+.It
+Applications that gift buffers into the XDR ioq
+.Pq e.g. Ceph FSAL zerocopy READ
+must not free them until ntirpc destroys the ioq after ERRQUEUE completion.
+.It
+This is independent of any application-level zerocopy into ntirpc
+.Pq userspace buffer handoff .
+Both layers can be used together for end-to-end savings.
+.El
+.Ss NFS-Ganesha configuration
+When used under NFS-Ganesha, the same knobs are exposed as
+.Va NFS_Core_Param
+options (mapped into
+.Vt svc_init_params ) :
+.Bd -literal -offset indent
+NFS_Core_Param {
+	Enable_Socket_Zerocopy = true;
+	Socket_Zerocopy_Threshold = 16384;   /* 0 = ntirpc default */
+	Socket_Zerocopy_Max_Pending = 0;     /* 0 = ntirpc default */
+}
+.Ed
+.Pp
+See also Ganesha documentation
+.Pa src/doc/socket_zerocopy.md
+in the NFS-Ganesha tree.
+.Sh RETURN VALUES
+.Fn svc_init
+returns
+.Dv true
+on success,
+.Dv false
+on failure.
+.Fn svc_set_socket_zerocopy
+returns no value.
+.Sh SEE ALSO
+.Xr sendmsg 2 ,
+.Xr setsockopt 2 ,
+.Xr rpc 3 ,
+.Xr rpc_svc_calls 3 ,
+.Xr rpc_svc_create 3
+.Pp
+Linux kernel documentation:
+.Lk https://docs.kernel.org/networking/msg_zerocopy.html MSG_ZEROCOPY
+.Sh HISTORY
+Socket TX zerocopy support was added to ntirpc for large TCP reply sends
+with deferred buffer release on ERRQUEUE completion.

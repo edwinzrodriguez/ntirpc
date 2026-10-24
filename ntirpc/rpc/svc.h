@@ -148,6 +148,19 @@ typedef struct svc_init_params {
 	svc_reply_done_fun_t reply_done_cb;
 	/** When true, stamp fine CLOCK_MONOTONIC stage times on ioq/svc_req */
 	bool stage_timing;
+	/**
+	 * When true (and kernel supports it), enable SO_ZEROCOPY on accepted
+	 * TCP sockets and use MSG_ZEROCOPY for large sends. Completions arrive
+	 * via the socket error queue (EPOLLERR / MSG_ERRQUEUE).
+	 */
+	bool socket_zerocopy;
+	/** Min send size (bytes) to attempt MSG_ZEROCOPY. 0 = default 16KiB. */
+	u_int socket_zerocopy_threshold;
+	/**
+	 * Cap on outstanding unsent/uncompleted ZC payload bytes per xprt.
+	 * 0 = default 64MiB. Over cap falls back to classic sendmsg.
+	 */
+	u_int socket_zerocopy_max_pending;
 
 	u_long flags;
 	u_int max_connections;	/* xprts */
@@ -193,6 +206,8 @@ typedef struct svc_init_params {
 #define SVC_XPRT_FLAG_REMOTE_ADDR_SET	0x0200	/* remote addr was final set */
 #define SVC_XPRT_FLAG_READY		0x0400	/* ready to use */
 #define SVC_XPRT_FLAG_IOQ_WRITING	0x0800	/* xprt is used by svc_ioq_write */
+/** SO_ZEROCOPY was successfully set on this TCP socket */
+#define SVC_XPRT_FLAG_SO_ZEROCOPY	0x1000
 
 #define SVC_XPRT_FLAG_DESTROYED (SVC_XPRT_FLAG_DESTROYING \
 				| SVC_XPRT_FLAG_RELEASING)
@@ -449,6 +464,8 @@ extern void svc_resume(struct svc_req *req);
 
 /** Enable/disable fine-grained IO stage stamps in ntirpc (runtime). */
 extern void svc_set_stage_timing(bool enable);
+/** Enable/disable socket TX zerocopy at runtime (affects new accepts + sends). */
+extern void svc_set_socket_zerocopy(bool enable);
 
 extern void svc_rqst_qos_suspend_socket(struct svc_xprt *xprt);
 

@@ -33,6 +33,7 @@
 #endif
 
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <errno.h>
 
@@ -772,6 +773,11 @@ xdr_ioq_create(size_t min_bsize, size_t max_bsize, u_int uio_flags)
 	xioq->xdrs[0].x_flags |= XDR_FLAG_FREE;
 	xioq->ioq_uv.min_bsize = min_bsize;
 	xioq->ioq_uv.max_bsize = max_bsize;
+	/* UINT32_MAX = no MSG_ZEROCOPY IDs yet (0 is a valid kernel ID) */
+	xioq->zc_id_lo = UINT32_MAX;
+	xioq->zc_id_hi = UINT32_MAX;
+	xioq->zc_tracked = false;
+	xioq->zc_awaiting = false;
 
 	if (!(uio_flags & UIO_FLAG_BUFQ)) {
 		struct xdr_ioq_uv *uv = xdr_ioq_uv_create(min_bsize, uio_flags);

@@ -67,6 +67,9 @@ struct svc_params {
 	svc_xprt_free_fun_t free_cb;
 	svc_reply_done_fun_t reply_done_cb;
 	bool stage_timing;
+	bool socket_zerocopy;
+	u_int socket_zerocopy_threshold;
+	u_int socket_zerocopy_max_pending;
 
 	struct {
 		int ctx_hash_partitions;
@@ -80,6 +83,15 @@ struct svc_params {
 		u_int thrd_max;
 		u_int thrd_min;
 	} ioq;
+
+	/* Socket ZC metrics (atomically updated; best-effort) */
+	struct {
+		uint64_t sends;
+		uint64_t completions;
+		uint64_t copied;	/* SO_EE_CODE_ZEROCOPY_COPIED */
+		uint64_t enobufs;
+		uint64_t fallback;
+	} zc_stats;
 
 	u_long flags;
 	u_int max_connections;

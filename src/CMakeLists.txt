@@ -62,6 +62,7 @@ SET(ntirpc_common_SRCS
   xdr_reference.c
   xdr_ioq.c
   svc_ioq.c
+  svc_zc.c
   work_pool.c
 )
 

@@ -64,6 +64,7 @@
 #include <getpeereid.h>
 #include <misc/opr.h>
 #include "svc_ioq.h"
+#include "svc_zc.h"
 
 #define LAST_FRAG ((u_int32_t)(1 << 31))
 #define LAST_FRAG_XDR_UNITS ((LAST_FRAG - 1) & ~(BYTES_PER_XDR_UNIT - 1))
@@ -154,6 +155,7 @@ svc_ioq_flushv(SVCXPRT *xprt, struct xdr_ioq *xioq)
 	while (remaining > 0) {
 		int i;
 		int frag_hdr_size = 0;
+		bool zc_new_frag_hdr = false;
 
 		/* Note that there may be lots of re-walking the ioq to
 		 * count the number of buffers or fill the buffers in the vio,
@@ -180,11 +182,41 @@ svc_ioq_flushv(SVCXPRT *xprt, struct xdr_ioq *xioq)
 			/* We need a fragment header, or to complete it. Look
 			 * at xioq->frag_hdr_bytes_sent to know how many bytes
 			 * of it we have sent so far.
+			 *
+			 * MSG_ZEROCOPY may pin header bytes until ERRQUEUE
+			 * completion (loopback uses deferred copy). A stack
+			 * local is invalid after flushv returns — keep the
+			 * header in xioq when ZC is likely for this chunk.
 			 */
 			frag_needed = 1;
 			frag_header = htonl((u_int32_t) (fbytes | last_frag));
-			iov[0].iov_base = ((char *) &frag_header) +
-						xioq->frag_hdr_bytes_sent;
+			zc_new_frag_hdr = true;
+#if defined(HAVE_SO_ZEROCOPY)
+			/*
+			 * MSG_ZEROCOPY may pin header bytes until ERRQUEUE
+			 * completion. Use durable xioq storage when this send
+			 * will actually take the ZC path.
+			 */
+			if (svc_zc_eligible(
+				    xprt, xioq,
+				    (size_t)fbytes +
+					    (sizeof(frag_header) -
+					     (size_t)xioq->frag_hdr_bytes_sent),
+				    true)) {
+				xioq->frag_hdr_be = frag_header;
+				iov[0].iov_base =
+					((char *)&xioq->frag_hdr_be) +
+					xioq->frag_hdr_bytes_sent;
+			} else {
+				iov[0].iov_base =
+					((char *)&frag_header) +
+					xioq->frag_hdr_bytes_sent;
+			}
+#else
+			iov[0].iov_base =
+				((char *)&frag_header) +
+				xioq->frag_hdr_bytes_sent;
+#endif
 			iov[0].iov_len = sizeof(frag_header) -
 						xioq->frag_hdr_bytes_sent;
 			frag_hdr_size = iov[0].iov_len;
@@ -236,29 +268,39 @@ again:
 			"iov_count: {}", remaining, frag_needed,
 			iov_count);
 
-		/* non-blocking write */
-		errno = 0;
-		result = sendmsg(xprt->xp_fd, &msg, MSG_DONTWAIT);
-		error = errno;
+		{
+			bool use_zc = false;
 
-		__warnx((error == EWOULDBLOCK || error == EAGAIN || error == 0)
-				? TIRPC_DEBUG_FLAG_SVC_VC
-				: TIRPC_DEBUG_FLAG_ERROR,
-			"%s: %p fd %d msg_iov %p sendmsg remaining %"
-			PRIu32" result %ld error %s (%d)",
-			__func__, xprt, xprt->xp_fd, msg.msg_iov,
-			remaining, (long int) result,
-			strerror(error), error);
+			/*
+			 * svc_zc_sendmsg installs the predicted ZC id on zcq
+			 * before MSG_ZEROCOPY sendmsg so ERRQUEUE drain cannot
+			 * race ahead and drop the completion (pending leak).
+			 */
+			result = svc_zc_sendmsg(xprt, xioq, &msg, MSG_DONTWAIT,
+						zc_new_frag_hdr, &use_zc,
+						&error);
+			__warnx((error == EWOULDBLOCK || error == EAGAIN ||
+				 error == 0)
+					? TIRPC_DEBUG_FLAG_SVC_VC
+					: TIRPC_DEBUG_FLAG_ERROR,
+				"%s: %p fd %d msg_iov %p sendmsg remaining %"
+				PRIu32" result %ld zc %d xp_flags %x szc %d error %s (%d)",
+				__func__, xprt, xprt->xp_fd, msg.msg_iov,
+				remaining, (long int)result, (int)use_zc,
+				(unsigned int)xprt->xp_flags,
+				(int)__svc_params->socket_zerocopy,
+				strerror(error), error);
 
-		if (unlikely(result < 0)) {
-			if (error == EWOULDBLOCK || error == EAGAIN) {
-				/* Socket buffer full; don't destroy */
-				error = EWOULDBLOCK;
-				xioq->has_blocked = true;
-			} else {
-				error = result;
+			if (unlikely(result < 0)) {
+				if (error == EWOULDBLOCK || error == EAGAIN) {
+					/* Socket buffer full; don't destroy */
+					error = EWOULDBLOCK;
+					xioq->has_blocked = true;
+				} else {
+					error = result;
+				}
+				break;
 			}
-			break;
 		}
 
 		if (result < frag_hdr_size) {
@@ -328,12 +370,40 @@ again:
 	return error;
 }
 
+static void svc_ioq_write_impl(SVCXPRT *xprt, bool et_retry);
+
 void svc_ioq_write(SVCXPRT *xprt)
+{
+	svc_ioq_write_impl(xprt, true);
+}
+
+/*
+ * Resume a writeq blocked on EWOULDBLOCK once ZC completions (or other
+ * progress) may have freed socket buffer space. No-op if a writer is active.
+ */
+void svc_ioq_write_resume(SVCXPRT *xprt)
+{
+	struct rpc_dplx_rec *rec = REC_XPRT(xprt);
+	bool pending;
+
+	if (xprt->xp_flags & (SVC_XPRT_FLAG_IOQ_WRITING |
+			      SVC_XPRT_FLAG_DESTROYED))
+		return;
+
+	mutex_lock(&rec->writeq.qmutex);
+	pending = TAILQ_FIRST(&rec->writeq.qh) != NULL;
+	mutex_unlock(&rec->writeq.qmutex);
+	if (pending)
+		svc_ioq_write_impl(xprt, false);
+}
+
+static void svc_ioq_write_impl(SVCXPRT *xprt, bool et_retry)
 {
 	struct rpc_dplx_rec *rec = REC_XPRT(xprt);
 	struct xdr_ioq *xioq;
 	struct poolq_entry *have;
 	bool destroy_xprt = false;
+	bool blocked = false;
 	struct timespec ts = {
 		.tv_sec = 0,
 		.tv_nsec = 0,
@@ -409,6 +479,7 @@ void svc_ioq_write(SVCXPRT *xprt)
 			XPRT_UNIQUE_AUTO_TRACEPOINT(xprt, mutex_unlock,
 				TRACE_DEBUG, "Unlocking mutex");
 			mutex_unlock(&rec->writeq.qmutex);
+			blocked = true;
 			break;
 		} else {
 			if (xioq->has_blocked) {
@@ -442,18 +513,41 @@ void svc_ioq_write(SVCXPRT *xprt)
 		have = TAILQ_FIRST(&rec->writeq.qh);
 		mutex_unlock(&rec->writeq.qmutex);
 
-		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
-			"%s: %p fd %d About to release",
-			__func__, xprt, xprt->xp_fd);
-		svc_ioq_reply_done(xioq, 0);
-		SVC_RELEASE(xprt, SVC_RELEASE_FLAG_NONE);
-		XDR_DESTROY(xioq->xdrs);
+		if (xioq->zc_id_lo != UINT32_MAX) {
+			/*
+			 * Used MSG_ZEROCOPY — ioq is already on zcq from
+			 * svc_zc_sendmsg. Mark awaiting release; may finish
+			 * immediately if ERRQUEUE already completed.
+			 */
+			__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+				"%s: %p fd %d defer release for ZC ids %u..%u",
+				__func__, xprt, xprt->xp_fd,
+				xioq->zc_id_lo, xioq->zc_id_hi);
+			svc_zc_park(xprt, xioq);
+		} else {
+			__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+				"%s: %p fd %d About to release",
+				__func__, xprt, xprt->xp_fd);
+			svc_ioq_reply_done(xioq, 0);
+			SVC_RELEASE(xprt, SVC_RELEASE_FLAG_NONE);
+			XDR_DESTROY(xioq->xdrs);
+		}
+
+		/* Opportunistic ERRQUEUE drain after progress */
+		svc_zc_drain(xprt, false);
 	}
 	atomic_postclear_uint16_t_bits(&xprt->xp_flags,
 				SVC_XPRT_FLAG_IOQ_WRITING);
 
 	if (destroy_xprt) {
 		SVC_DESTROY(xprt);
+	} else if (blocked && et_retry) {
+		/*
+		 * EPOLLOUT is edge-triggered. Writability may return before
+		 * SEND was armed (or when ZC completions free skbuffs without
+		 * a fresh edge). One immediate retry avoids a permanent stall.
+		 */
+		svc_ioq_write_impl(xprt, false);
 	}
 }
 
