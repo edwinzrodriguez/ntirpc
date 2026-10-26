@@ -402,17 +402,31 @@ void svc_ioq_write(SVCXPRT *xprt)
 void svc_ioq_write_resume(SVCXPRT *xprt)
 {
 	struct rpc_dplx_rec *rec = REC_XPRT(xprt);
-	bool pending;
+	struct poolq_entry *have;
+	struct xdr_ioq *xioq;
 
 	if (xprt->xp_flags & (SVC_XPRT_FLAG_IOQ_WRITING |
 			      SVC_XPRT_FLAG_DESTROYED))
 		return;
 
 	mutex_lock(&rec->writeq.qmutex);
-	pending = TAILQ_FIRST(&rec->writeq.qh) != NULL;
+	have = TAILQ_FIRST(&rec->writeq.qh);
+	if (have == NULL) {
+		mutex_unlock(&rec->writeq.qmutex);
+		return;
+	}
+	xioq = _IOQ(have);
+	/*
+	 * SEND epoll task owns this ioq (IOQ_FLAG_WORKING) until it runs.
+	 * Do not write/finish it from an ERRQUEUE drain on another thread —
+	 * that races with svc_rqst_epoll_loop calling ioq_wpe.fun.
+	 */
+	if (xioq->ioq_s.qflags & IOQ_FLAG_WORKING) {
+		mutex_unlock(&rec->writeq.qmutex);
+		return;
+	}
 	mutex_unlock(&rec->writeq.qmutex);
-	if (pending)
-		svc_ioq_write_impl(xprt, false);
+	svc_ioq_write_impl(xprt, false);
 }
 
 static void svc_ioq_write_impl(SVCXPRT *xprt, bool et_retry)
@@ -552,7 +566,7 @@ static void svc_ioq_write_impl(SVCXPRT *xprt, bool et_retry)
 		}
 
 		/* Opportunistic ERRQUEUE drain after progress */
-		svc_zc_drain(xprt, false);
+		svc_zc_drain(xprt, false, true);
 	}
 	atomic_postclear_uint16_t_bits(&xprt->xp_flags,
 				SVC_XPRT_FLAG_IOQ_WRITING);
