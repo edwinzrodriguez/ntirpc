@@ -467,6 +467,21 @@ extern void svc_set_stage_timing(bool enable);
 /** Enable/disable socket TX zerocopy at runtime (affects new accepts + sends). */
 extern void svc_set_socket_zerocopy(bool enable);
 
+/** Snapshot of MSG_ZEROCOPY counters (atomically read; best-effort). */
+struct svc_socket_zerocopy_stats {
+	bool enabled;
+	u_int threshold;
+	u_int max_pending;
+	uint64_t sends;
+	uint64_t completions;
+	uint64_t copied; /* SO_EE_CODE_ZEROCOPY_COPIED */
+	uint64_t enobufs;
+	uint64_t fallback;
+};
+
+extern void svc_get_socket_zerocopy_stats(struct svc_socket_zerocopy_stats *out);
+extern void svc_reset_socket_zerocopy_stats(void);
+
 extern void svc_rqst_qos_suspend_socket(struct svc_xprt *xprt);
 
 extern void svc_rqst_qos_resume_socket(struct svc_xprt *xprt);

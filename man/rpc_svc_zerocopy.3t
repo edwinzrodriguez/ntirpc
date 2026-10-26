@@ -6,7 +6,9 @@
 .Sh NAME
 .Nm rpc_svc_zerocopy ,
 .Nm svc_init ,
-.Nm svc_set_socket_zerocopy
+.Nm svc_set_socket_zerocopy ,
+.Nm svc_get_socket_zerocopy_stats ,
+.Nm svc_reset_socket_zerocopy_stats
 .Nd TCP socket transmit zerocopy for RPC replies
 .Sh LIBRARY
 .Lb libntirpc
@@ -16,6 +18,10 @@
 .Fn svc_init "svc_init_params *params"
 .Ft void
 .Fn svc_set_socket_zerocopy "bool enable"
+.Ft void
+.Fn svc_get_socket_zerocopy_stats "struct svc_socket_zerocopy_stats *out"
+.Ft void
+.Fn svc_reset_socket_zerocopy_stats void
 .Sh DESCRIPTION
 On Linux, ntirpc can send large connection-oriented (TCP) RPC replies with
 .Dv MSG_ZEROCOPY
@@ -135,6 +141,26 @@ NFS_Core_Param {
 See also Ganesha documentation
 .Pa src/doc/socket_zerocopy.md
 in the NFS-Ganesha tree.
+.Ss Statistics
+.Fn svc_get_socket_zerocopy_stats
+returns a snapshot of
+.Va sends ,
+.Va completions ,
+.Va copied
+.Pq Dv SO_EE_CODE_ZEROCOPY_COPIED ,
+.Va enobufs ,
+and
+.Va fallback ,
+plus the effective threshold and max-pending.
+.Fn svc_reset_socket_zerocopy_stats
+clears the counters.
+Under NFS-Ganesha these are exposed as DBus method
+.Nm GetSocketZerocopyStats
+and
+.Nm ganesha_stats.py Cm socket_zc
+.Pq also Cm json Cm socket_zc ;
+.Nm ganesha_stats.py Cm reset
+clears them with the other counters.
 .Sh RETURN VALUES
 .Fn svc_init
 returns
