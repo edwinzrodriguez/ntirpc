@@ -310,6 +310,31 @@ void svc_set_socket_zerocopy(bool enable)
 	__svc_params->socket_zerocopy = enable;
 }
 
+void svc_get_socket_zerocopy_stats(struct svc_socket_zerocopy_stats *out)
+{
+	if (!out)
+		return;
+	out->enabled = __svc_params->socket_zerocopy;
+	out->threshold = __svc_params->socket_zerocopy_threshold;
+	out->max_pending = __svc_params->socket_zerocopy_max_pending;
+	out->sends = __sync_fetch_and_add(&__svc_params->zc_stats.sends, 0);
+	out->completions =
+	    __sync_fetch_and_add(&__svc_params->zc_stats.completions, 0);
+	out->copied = __sync_fetch_and_add(&__svc_params->zc_stats.copied, 0);
+	out->enobufs = __sync_fetch_and_add(&__svc_params->zc_stats.enobufs, 0);
+	out->fallback =
+	    __sync_fetch_and_add(&__svc_params->zc_stats.fallback, 0);
+}
+
+void svc_reset_socket_zerocopy_stats(void)
+{
+	__sync_lock_test_and_set(&__svc_params->zc_stats.sends, 0);
+	__sync_lock_test_and_set(&__svc_params->zc_stats.completions, 0);
+	__sync_lock_test_and_set(&__svc_params->zc_stats.copied, 0);
+	__sync_lock_test_and_set(&__svc_params->zc_stats.enobufs, 0);
+	__sync_lock_test_and_set(&__svc_params->zc_stats.fallback, 0);
+}
+
 /* ***************  SVCXPRT related stuff **************** */
 
 /*
