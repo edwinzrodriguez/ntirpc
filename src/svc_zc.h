@@ -53,9 +53,15 @@ void svc_zc_park(SVCXPRT *xprt, struct xdr_ioq *xioq);
 
 /**
  * Drain MSG_ERRQUEUE on xp_fd; release completed zcq entries.
- * Safe to call with or without writeq.qmutex held (uses @have_lock).
+ * Safe to call with or without writeq.qmutex held (uses @have_writeq_lock).
+ *
+ * @resume_writes  If true, kick svc_ioq_write_resume after drain (ET EPOLLOUT
+ *                 may not re-edge when completions free skbuffs). Pass false
+ *                 when the caller is about to run the SEND task for this
+ *                 event — otherwise resume can finish/free xioq_send while
+ *                 epoll still holds that ioq for ioq_wpe.fun.
  */
-void svc_zc_drain(SVCXPRT *xprt, bool have_writeq_lock);
+void svc_zc_drain(SVCXPRT *xprt, bool have_writeq_lock, bool resume_writes);
 
 /** Destroy all parked ZC replies (xprt teardown). */
 void svc_zc_clear(struct rpc_dplx_rec *rec);

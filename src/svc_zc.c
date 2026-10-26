@@ -78,10 +78,11 @@ void svc_zc_park(SVCXPRT *xprt, struct xdr_ioq *xioq)
 	(void)xioq;
 }
 
-void svc_zc_drain(SVCXPRT *xprt, bool have_writeq_lock)
+void svc_zc_drain(SVCXPRT *xprt, bool have_writeq_lock, bool resume_writes)
 {
 	(void)xprt;
 	(void)have_writeq_lock;
+	(void)resume_writes;
 }
 
 void svc_zc_clear(struct rpc_dplx_rec *rec)
@@ -408,6 +409,14 @@ svc_zc_take_one(struct rpc_dplx_rec *rec, struct xdr_ioq *xioq)
 static void
 svc_zc_finish_one(SVCXPRT *xprt, struct xdr_ioq *xioq, int status)
 {
+#if defined(TIRPC_EPOLL)
+	struct rpc_dplx_rec *rec = REC_XPRT(xprt);
+
+	/* Drop stale SEND epoll cookie before free (UAF → NULL ioq_wpe.fun). */
+	if (rec->ev_u.epoll.xioq_send == xioq)
+		rec->ev_u.epoll.xioq_send = NULL;
+#endif
+
 	svc_ioq_reply_done(xioq, status);
 	SVC_RELEASE(xprt, SVC_RELEASE_FLAG_NONE);
 	XDR_DESTROY(xioq->xdrs);
@@ -473,7 +482,7 @@ void svc_zc_park(SVCXPRT *xprt, struct xdr_ioq *xioq)
 	if (done != NULL)
 		svc_zc_finish_one(xprt, done, 0);
 	else
-		svc_zc_drain(xprt, false);
+		svc_zc_drain(xprt, false, true);
 }
 
 static void
@@ -562,7 +571,7 @@ svc_zc_recv_and_apply(SVCXPRT *xprt, struct poolq_head *doneq)
 	return false;
 }
 
-void svc_zc_drain(SVCXPRT *xprt, bool have_writeq_lock)
+void svc_zc_drain(SVCXPRT *xprt, bool have_writeq_lock, bool resume_writes)
 {
 	struct rpc_dplx_rec *rec = REC_XPRT(xprt);
 	struct poolq_head doneq;
@@ -590,10 +599,12 @@ void svc_zc_drain(SVCXPRT *xprt, bool have_writeq_lock)
 	svc_zc_finish_q(xprt, &doneq, 0);
 	if (have_writeq_lock)
 		mutex_lock(&rec->writeq.qmutex);
-	else {
+	else if (resume_writes) {
 		/*
 		 * Completions free skbuff/optmem; a writeq head blocked on
 		 * EWOULDBLOCK may not see EPOLLOUT (edge-triggered). Kick it.
+		 * Skip when the EPOLLERR handler will run the SEND task —
+		 * resume must not finish/free xioq_send first.
 		 */
 		svc_ioq_write_resume(xprt);
 	}
