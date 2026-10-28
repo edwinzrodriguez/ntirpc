@@ -29,11 +29,29 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <time.h>
+#include <sys/uio.h>
 #include <misc/opr.h>
 #include <misc/queue.h>
 #include <rpc/pool_queue.h>
 #include <rpc/work_pool.h>
 #include <rpc/xdr.h>
+
+/**
+ * Upper-layer allocator for WRITE payload pages.
+ *
+ * @param ctx       xioq->payload_alloc_ctx
+ * @param data_len  exact payload byte count (no XDR pad)
+ * @param iov_out   set to an iovec array owned with @p cookie_out
+ * @param iovcnt_out
+ * @param cookie_out opaque (e.g. ceph_bufferlist *); released via @p release_out
+ * @param release_out called as release(cookie) if fill fails after alloc, or by
+ *                    the FSAL when it declines ownership
+ * @return true on success
+ */
+typedef bool (*xdr_payload_alloc_fn)(void *ctx, u_int data_len,
+				     struct iovec **iov_out, int *iovcnt_out,
+				     void **cookie_out,
+				     void (**release_out)(void *cookie));
 
 #ifdef USE_RPC_RDMA
 
@@ -163,6 +181,15 @@ struct xdr_ioq {
 #endif
 
 	struct rpc_dplx_rec *rec;
+
+	/**
+	 * Optional upper-layer WRITE payload allocator.
+	 * When set, xdr_ioq_fill_payload() asks this callback for pages,
+	 * copies any already-buffered body, and readvs deferred socket
+	 * remainder into those pages.
+	 */
+	xdr_payload_alloc_fn payload_alloc;
+	void *payload_alloc_ctx;
 };
 
 #define _IOQ(p) (opr_containerof((p), struct xdr_ioq, ioq_s))
@@ -221,6 +248,34 @@ void xdr_ioq_donate_cancel(struct xdr_donate_cookie *cookie);
  * cookie when every segment has been released.
  */
 void xdr_ioq_donate_deleter(void *buf, size_t len, void *priv);
+
+/**
+ * Register upper-layer WRITE payload allocator on this decode stream.
+ * Typically set by Ganesha before COMPOUND/WRITE decode when the export
+ * wants allocate_own_write_buffer.
+ */
+void xdr_ioq_set_payload_alloc(XDR *xdrs, xdr_payload_alloc_fn fn, void *ctx);
+
+/** @return true if @c xdr_ioq_set_payload_alloc installed a callback. */
+bool xdr_ioq_has_payload_alloc(XDR *xdrs);
+
+/**
+ * Fill WRITE payload into upper-layer pages (Phase 1).
+ *
+ * Calls @c payload_alloc for @p data_len bytes, copies any body already
+ * buffered at @p start, then readvs any VC-deferred remainder from the
+ * socket. Appends @c UIO_FLAG_UPPER UVs for deferred bytes so SETPOS past
+ * RNDUP(@p data_len) succeeds. On success, @p iov_out / @p cookie_out / @p release_out are owned by the
+ * caller (do not free_buffer the iov bases). Call @p release_out(@p cookie_out)
+ * if ownership is not transferred to the FSAL write path.
+ *
+ * @return false if no callback, alloc failure, or I/O error — caller should
+ *         fall back to XDR_FILLBUFS / donate-claim.
+ */
+bool xdr_ioq_fill_payload(XDR *xdrs, u_int start, u_int data_len,
+			  struct iovec **iov_out, int *iovcnt_out,
+			  void **cookie_out,
+			  void (**release_out)(void *cookie));
 
 extern struct xdr_ioq *xdr_ioq_create(size_t min_bsize, size_t max_bsize,
 				      u_int uio_flags);

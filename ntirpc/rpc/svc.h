@@ -942,6 +942,28 @@ svc_vc_ncreate(const int fd, const u_int sendsize, const u_int recvsize)
 	return (svc_vc_ncreatef(fd, sendsize, recvsize, SVC_CREATE_FLAG_CLOSE));
 }
 
+/**
+ * Enable header staging for upper-layer WRITE payload alloc.
+ * Large LAST_FRAG bodies beyond @p hdr_stage_max stay on the socket as
+ * sx_body_remain until xdr_ioq_fill_payload readvs them (or drain after
+ * the request if unused). @p hdr_stage_max 0 selects the default (256KiB).
+ */
+void svc_vc_set_payload_defer(SVCXPRT *xprt, bool enable, u_int hdr_stage_max);
+
+/** Bytes still deferred on the socket for the in-flight call (0 if none). */
+uint32_t svc_vc_body_remain(SVCXPRT *xprt);
+
+/**
+ * readv up to @p nbytes of deferred body into @p iov (starting at byte
+ * @p iov_off within the iovec). Decrements sx_body_remain.
+ * @return bytes read, or -1 on error.
+ */
+ssize_t svc_vc_readv_body(SVCXPRT *xprt, struct iovec *iov, int iovcnt,
+			  size_t iov_off, size_t nbytes);
+
+/** Recv any leftover sx_body_remain into a throwaway buffer (stream sync). */
+void svc_vc_drain_body_remain(SVCXPRT *xprt);
+
 extern SVCXPRT *svc_dg_ncreatef(const int, const u_int, const u_int,
 				const uint32_t);
 /*

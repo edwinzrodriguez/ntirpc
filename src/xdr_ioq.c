@@ -691,6 +691,16 @@ xdr_ioq_uv_release(struct xdr_ioq_uv *uv)
 				__func__, uv, uv->v.vio_base);
 			uv->v.vio_base = NULL;
 			mem_free(uv, sizeof(*uv));
+		} else if (uv->u.uio_flags & UIO_FLAG_UPPER) {
+			/*
+			 * Upper-layer owned pages (fill_payload). Cookie/release
+			 * are the caller's; only drop UV metadata.
+			 */
+			__warnx(TIRPC_DEBUG_FLAG_XDR,
+				"%s() upper uv %p base %p — skip free_buffer",
+				__func__, uv, uv->v.vio_base);
+			uv->v.vio_base = NULL;
+			mem_free(uv, sizeof(*uv));
 		} else if (uv->u.uio_flags & UIO_FLAG_FREE) {
 			free_buffer(uv->v.vio_base, ioquv_size(uv));
 			mem_free(uv, sizeof(*uv));
@@ -1366,8 +1376,14 @@ xdr_ioq_setpos(XDR *xdrs, u_int pos)
 		struct xdr_ioq_uv *uv = IOQ_(have);
 		struct xdr_ioq_uv *next = IOQ_(TAILQ_NEXT(have, q));
 		u_int len = ioquv_length(uv);
-		u_int full = (uintptr_t)xdrs->x_v.vio_wrap
-			   - (uintptr_t)xdrs->x_v.vio_head;
+		/*
+		 * Capacity of *this* UV — do not use xdrs->x_v here. After
+		 * fill_payload appends UIO_FLAG_UPPER UVs, x_v still points at
+		 * the staging UV; using it makes "last" pos==len fail and
+		 * breaks deferred upper-layer WRITE decode.
+		 */
+		u_int full = (uintptr_t)uv->v.vio_wrap
+			   - (uintptr_t)uv->v.vio_head;
 
 		__warnx(TIRPC_DEBUG_FLAG_XDR,
 			"%s Examining xdr_ioq_uv %p (base %p head %p tail %p wrap %p len %lu full %lu) - %s pos %lu",
@@ -2162,6 +2178,288 @@ xdr_ioq_donate_deleter(void *buf, size_t len, void *priv)
 			"%s() donate cookie remaining underflow", __func__);
 		abort();
 	}
+}
+
+void
+xdr_ioq_set_payload_alloc(XDR *xdrs, xdr_payload_alloc_fn fn, void *ctx)
+{
+	struct xdr_ioq *xioq;
+
+	if (xdrs == NULL ||
+	    (xdrs->x_ops != &xdr_ioq_ops
+#ifdef USE_RPC_RDMA
+	     && xdrs->x_ops != &xdr_ioq_ops_rdma
+#endif
+	    ))
+		return;
+
+	xioq = XIOQ(xdrs);
+	xioq->payload_alloc = fn;
+	xioq->payload_alloc_ctx = ctx;
+}
+
+bool
+xdr_ioq_has_payload_alloc(XDR *xdrs)
+{
+	if (xdrs == NULL ||
+	    (xdrs->x_ops != &xdr_ioq_ops
+#ifdef USE_RPC_RDMA
+	     && xdrs->x_ops != &xdr_ioq_ops_rdma
+#endif
+	    ))
+		return false;
+	return XIOQ(xdrs)->payload_alloc != NULL;
+}
+
+/**
+ * Copy @p len bytes from the ioq stream at absolute offset @p start into
+ * @p dst_iov starting at @p dst_off. Returns bytes copied (may be less than
+ * @p len if the stream ends early).
+ */
+static size_t
+xdr_ioq_copy_from_stream(XDR *xdrs, u_int start, size_t len,
+			 struct iovec *dst_iov, int dst_iovcnt, size_t dst_off)
+{
+	struct poolq_entry *have;
+	size_t copied = 0;
+	u_int pos = start;
+
+	TAILQ_FOREACH(have, &(XIOQ(xdrs)->ioq_uv.uvqh.qh), q) {
+		struct xdr_ioq_uv *uv = IOQ_(have);
+		u_int uvlen = ioquv_length(uv);
+		u_int skip;
+		size_t take;
+		const uint8_t *src;
+		size_t di;
+		size_t off;
+
+		if (len == 0)
+			break;
+
+		if (pos >= uvlen) {
+			pos -= uvlen;
+			continue;
+		}
+
+		skip = pos;
+		pos = 0;
+		take = uvlen - skip;
+		if (take > len)
+			take = len;
+
+		src = (const uint8_t *)uv->v.vio_head + skip;
+		off = dst_off + copied;
+		di = 0;
+		while (take > 0 && (int)di < dst_iovcnt) {
+			size_t iov_len = dst_iov[di].iov_len;
+			uint8_t *base = dst_iov[di].iov_base;
+
+			if (off >= iov_len) {
+				off -= iov_len;
+				di++;
+				continue;
+			}
+			{
+				size_t chunk = iov_len - off;
+
+				if (chunk > take)
+					chunk = take;
+				memcpy(base + off, src, chunk);
+				src += chunk;
+				take -= chunk;
+				copied += chunk;
+				len -= chunk;
+				off = 0;
+				di++;
+			}
+		}
+	}
+	return copied;
+}
+
+/** Append a UIO_FLAG_UPPER UV covering [@p base, @p base+@p len). */
+static bool
+xdr_ioq_append_upper_uv(struct xdr_ioq *xioq, void *base, size_t len)
+{
+	struct xdr_ioq_uv *uv;
+
+	uv = mem_zalloc(sizeof(*uv));
+	if (uv == NULL)
+		return false;
+
+	TAILQ_INIT_ENTRY(&uv->uvq, q);
+	uv->u.uio_flags = UIO_FLAG_UPPER;
+	uv->u.uio_references = 1;
+	uv->v.vio_base = base;
+	uv->v.vio_head = base;
+	uv->v.vio_tail = (char *)base + len;
+	uv->v.vio_wrap = uv->v.vio_tail;
+	uv->v.vio_length = len;
+	uv->v.vio_type = VIO_DATA;
+
+	(xioq->ioq_uv.uvqh.qcount)++;
+	TAILQ_INSERT_TAIL(&xioq->ioq_uv.uvqh.qh, &uv->uvq, q);
+	return true;
+}
+
+bool
+xdr_ioq_fill_payload(XDR *xdrs, u_int start, u_int data_len,
+		     struct iovec **iov_out, int *iovcnt_out,
+		     void **cookie_out,
+		     void (**release_out)(void *cookie))
+{
+	struct xdr_ioq *xioq;
+	struct iovec *iov = NULL;
+	int iovcnt = 0;
+	void *cookie = NULL;
+	void (*release)(void *) = NULL;
+	SVCXPRT *xprt;
+	size_t need;
+	size_t pad;
+	size_t copied;
+	size_t remain;
+	size_t body_avail;
+	ssize_t nread;
+	size_t i;
+	void *pad_heap = NULL;
+
+	if (iov_out == NULL || iovcnt_out == NULL || cookie_out == NULL ||
+	    release_out == NULL)
+		return false;
+	*iov_out = NULL;
+	*iovcnt_out = 0;
+	*cookie_out = NULL;
+	*release_out = NULL;
+
+	if (!xdr_ioq_has_payload_alloc(xdrs))
+		return false;
+
+	xioq = XIOQ(xdrs);
+	xdr_tail_update(xdrs);
+
+	if (data_len == 0)
+		return false;
+
+	if (!xioq->payload_alloc(xioq->payload_alloc_ctx, data_len, &iov,
+				 &iovcnt, &cookie, &release) ||
+	    iov == NULL || iovcnt <= 0 || cookie == NULL) {
+		__warnx(TIRPC_DEBUG_FLAG_XDR,
+			"%s() payload_alloc failed for %u bytes",
+			__func__, data_len);
+		return false;
+	}
+
+	need = RNDUP((size_t)data_len);
+	pad = need - (size_t)data_len;
+
+	copied = xdr_ioq_copy_from_stream(xdrs, start, data_len, iov, iovcnt, 0);
+	remain = (size_t)data_len - copied;
+
+	xprt = (SVCXPRT *)xdrs->x_lib[1];
+	body_avail = xprt ? svc_vc_body_remain(xprt) : 0;
+
+	if (remain > 0) {
+		if (xprt == NULL || body_avail < remain) {
+			__warnx(TIRPC_DEBUG_FLAG_ERROR,
+				"%s() need %zu more payload bytes, body_remain %zu",
+				__func__, remain, body_avail);
+			goto fail_release;
+		}
+		nread = svc_vc_readv_body(xprt, iov, iovcnt, copied, remain);
+		if (nread < 0 || (size_t)nread != remain) {
+			__warnx(TIRPC_DEBUG_FLAG_ERROR,
+				"%s() readv body got %zd want %zu",
+				__func__, nread, remain);
+			goto fail_release;
+		}
+		/* Append UPPER UVs for deferred bytes so SETPOS can walk them. */
+		{
+			size_t off = copied;
+			size_t left = remain;
+
+			for (i = 0; i < (size_t)iovcnt && left > 0; i++) {
+				size_t ilen = iov[i].iov_len;
+				char *base = iov[i].iov_base;
+
+				if (off >= ilen) {
+					off -= ilen;
+					continue;
+				}
+				{
+					size_t chunk = ilen - off;
+
+					if (chunk > left)
+						chunk = left;
+					if (!xdr_ioq_append_upper_uv(
+						    xioq, base + off, chunk))
+						goto fail_release;
+					left -= chunk;
+					off = 0;
+				}
+			}
+		}
+	}
+
+	/*
+	 * Consume XDR pad. Bytes already in FREE UVs are skipped via SETPOS
+	 * over the existing stream. Pad that was deferred on the socket must
+	 * be read and represented as a tiny FREE UV for position accounting.
+	 */
+	if (pad > 0) {
+		uint8_t scratch[3];
+		struct iovec piov = { .iov_base = scratch, .iov_len = pad };
+		size_t got;
+		size_t pad_left;
+
+		got = xdr_ioq_copy_from_stream(xdrs, start + data_len, pad,
+					       &piov, 1, 0);
+		pad_left = pad - got;
+		if (pad_left > 0) {
+			struct xdr_ioq_uv *uv;
+
+			if (xprt == NULL ||
+			    svc_vc_body_remain(xprt) < pad_left)
+				goto fail_release;
+			pad_heap = alloc_buffer(pad_left);
+			if (pad_heap == NULL)
+				goto fail_release;
+			piov.iov_base = pad_heap;
+			piov.iov_len = pad_left;
+			nread = svc_vc_readv_body(xprt, &piov, 1, 0, pad_left);
+			if (nread < 0 || (size_t)nread != pad_left)
+				goto fail_release;
+			uv = mem_zalloc(sizeof(*uv));
+			TAILQ_INIT_ENTRY(&uv->uvq, q);
+			uv->u.uio_flags = UIO_FLAG_FREE;
+			uv->u.uio_references = 1;
+			uv->v.vio_base = pad_heap;
+			uv->v.vio_head = pad_heap;
+			uv->v.vio_tail = (char *)pad_heap + pad_left;
+			uv->v.vio_wrap = uv->v.vio_tail;
+			uv->v.vio_length = pad_left;
+			uv->v.vio_type = VIO_DATA;
+			(xioq->ioq_uv.uvqh.qcount)++;
+			TAILQ_INSERT_TAIL(&xioq->ioq_uv.uvqh.qh, &uv->uvq, q);
+			pad_heap = NULL; /* owned by uv */
+		}
+	}
+
+	*iov_out = iov;
+	*iovcnt_out = iovcnt;
+	*cookie_out = cookie;
+	*release_out = release;
+
+	__warnx(TIRPC_DEBUG_FLAG_XDR,
+		"%s() filled %u bytes (copied %zu readv %zu) cookie %p",
+		__func__, data_len, copied, remain, cookie);
+	return true;
+
+fail_release:
+	if (pad_heap)
+		free_buffer(pad_heap, pad);
+	if (release && cookie)
+		release(cookie);
+	return false;
 }
 
 const struct xdr_ops xdr_ioq_ops = {
