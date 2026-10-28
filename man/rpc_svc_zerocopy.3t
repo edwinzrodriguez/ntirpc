@@ -116,6 +116,12 @@ on a zerocopy send fall back to a classic send for that chunk.
 Loopback traffic typically completes with
 .Dv SO_EE_CODE_ZEROCOPY_COPIED
 (deferred copy); the API and buffer lifetime rules are the same.
+After the first such completion on a transport, ntirpc clears
+.Dv SVC_XPRT_FLAG_SO_ZEROCOPY
+so subsequent sends on that socket omit
+.Dv MSG_ZEROCOPY
+(kernel guidance: the flag is a sticky signal for the socket, not a transient
+glitch). In-flight completions are still drained.
 .It
 Applications that gift buffers into the XDR ioq
 .Pq e.g. Ceph FSAL zerocopy READ

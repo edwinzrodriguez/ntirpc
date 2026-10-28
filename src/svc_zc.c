@@ -492,9 +492,26 @@ svc_zc_apply_range(struct rpc_dplx_rec *rec, uint32_t lo, uint32_t hi,
 	struct poolq_entry *have, *next;
 	struct xdr_ioq *xioq;
 	uint32_t id;
+	uint16_t prev;
 
-	if (copied)
+	if (copied) {
 		__sync_fetch_and_add(&__svc_params->zc_stats.copied, 1);
+		/*
+		 * Kernel docs: SO_EE_CODE_ZEROCOPY_COPIED means the send fell
+		 * back to a deferred copy (loopback always does; some NICs /
+		 * checksum paths do too). Pinning + ERRQUEUE cost with no TX
+		 * savings — stop MSG_ZEROCOPY on this socket. Not transient
+		 * for a given TCP path (see msg_zerocopy.rst "Deferred copies"
+		 * / "Loopback").
+		 */
+		prev = atomic_clear_uint16_t_bits(&rec->xprt.xp_flags,
+						  SVC_XPRT_FLAG_SO_ZEROCOPY);
+		if (prev & SVC_XPRT_FLAG_SO_ZEROCOPY)
+			__warnx(TIRPC_DEBUG_FLAG_EVENT,
+				"%s: fd %d SO_EE_CODE_ZEROCOPY_COPIED; "
+				"disabling MSG_ZEROCOPY on this xprt",
+				__func__, rec->xprt.xp_fd);
+	}
 
 	/* Inclusive range; handle wrap. */
 	id = lo;
@@ -577,7 +594,13 @@ void svc_zc_drain(SVCXPRT *xprt, bool have_writeq_lock, bool resume_writes)
 	struct poolq_head doneq;
 	int n = 0;
 
-	if (!(xprt->xp_flags & SVC_XPRT_FLAG_SO_ZEROCOPY))
+	/*
+	 * COPIED completions clear SVC_XPRT_FLAG_SO_ZEROCOPY so new sends
+	 * skip MSG_ZEROCOPY, but in-flight IDs still need ERRQUEUE drain.
+	 */
+	if (!(xprt->xp_flags & SVC_XPRT_FLAG_SO_ZEROCOPY) &&
+	    rec->zcq.qcount == 0 && rec->zc_pending_bytes == 0 &&
+	    rec->zc_orphan_n == 0)
 		return;
 
 	TAILQ_INIT(&doneq.qh);
