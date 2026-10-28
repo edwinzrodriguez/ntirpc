@@ -191,6 +191,9 @@ NTIRPC_${NTIRPC_VERSION_BASE} {
     xdr_float;
     xdr_free_null_stream;
     xdr_int;
+    xdr_ioq_donate_cancel;
+    xdr_ioq_donate_deleter;
+    xdr_ioq_donate_iovs;
     xdr_long;
     xdr_longlong_t;
     xdr_naccepted_reply;
