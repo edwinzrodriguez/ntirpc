@@ -192,6 +192,36 @@ extern struct poolq_entry *xdr_ioq_uv_fetch_nothing(struct xdr_ioq *xioq,
 						     u_int ioq_flags);
 extern void xdr_ioq_uv_release(struct xdr_ioq_uv *uv);
 
+/**
+ * Opaque cookie for recv-buffer donate → claim_iov.
+ *
+ * After a successful @c xdr_ioq_donate_iovs, XDR_DESTROY will not free the
+ * underlying UV payload. Pass the cookie as @c priv to the claim deleter
+ * (@c xdr_ioq_donate_deleter). Cancel only if claim/submit never takes the
+ * buffers (before async write consumes them).
+ */
+struct xdr_donate_cookie;
+
+/**
+ * Mark ioq UVs that back @p iov as @c UIO_FLAG_DONATED (clear FREE).
+ *
+ * @return cookie for @c xdr_ioq_donate_deleter, or NULL if @p xdrs is not an
+ *         ioq stream or any iov cannot be mapped to a FREE UV (nothing changed).
+ */
+struct xdr_donate_cookie *xdr_ioq_donate_iovs(XDR *xdrs,
+					      const struct iovec *iov,
+					      int iovcnt);
+
+/** Restore FREE on donated UVs and free @p cookie. No-op if @p cookie is NULL. */
+void xdr_ioq_donate_cancel(struct xdr_donate_cookie *cookie);
+
+/**
+ * Thread-safe claim deleter: maps slice → UV allocation base and frees the
+ * base when the last donated slice of that allocation is released. Frees the
+ * cookie when every segment has been released.
+ */
+void xdr_ioq_donate_deleter(void *buf, size_t len, void *priv);
+
 extern struct xdr_ioq *xdr_ioq_create(size_t min_bsize, size_t max_bsize,
 				      u_int uio_flags);
 extern void xdr_ioq_release(struct poolq_head *ioqh);

@@ -36,6 +36,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <errno.h>
+#include <sys/uio.h>
 
 #include <rpc/types.h>
 #include <misc/portable.h>
@@ -679,6 +680,16 @@ xdr_ioq_uv_release(struct xdr_ioq_uv *uv)
 			__warnx(TIRPC_DEBUG_FLAG_XDR, "Call uio_release");
 			uv->u.uio_refer->uio_release(uv->u.uio_refer,
 						     UIO_FLAG_NONE);
+			mem_free(uv, sizeof(*uv));
+		} else if (uv->u.uio_flags & UIO_FLAG_DONATED) {
+			/*
+			 * Payload ownership was transferred (claim_iov). The
+			 * claim deleter frees vio_base; only drop UV metadata.
+			 */
+			__warnx(TIRPC_DEBUG_FLAG_XDR,
+				"%s() donated uv %p base %p — skip free_buffer",
+				__func__, uv, uv->v.vio_base);
+			uv->v.vio_base = NULL;
 			mem_free(uv, sizeof(*uv));
 		} else if (uv->u.uio_flags & UIO_FLAG_FREE) {
 			free_buffer(uv->v.vio_base, ioquv_size(uv));
@@ -1910,6 +1921,247 @@ xdr_ioq_allochdrs(XDR *xdrs, u_int start, xdr_vio *vector, int iov_count)
 	XDR_SETPOS(xdrs, totlen);
 
 	return true;
+}
+
+/* Defined below; donate checks xdrs->x_ops against these. */
+extern const struct xdr_ops xdr_ioq_ops;
+#ifdef USE_RPC_RDMA
+extern const struct xdr_ops xdr_ioq_ops_rdma;
+#endif
+
+/*
+ * Donate / claim support for WRITE recv payloads.
+ *
+ * WRITE iov bases are often mid-UV (vio_head after headers). The claim deleter
+ * must free vio_base (full allocation), not the slice pointer. Multiple slices
+ * from one UV share one xdr_donate_alloc with an atomic refcount.
+ */
+struct xdr_donate_alloc {
+	void *base;
+	size_t len;
+	int32_t refs;
+};
+
+struct xdr_donate_seg {
+	void *slice;
+	size_t slice_len;
+	struct xdr_donate_alloc *alloc;
+	struct xdr_ioq_uv *uv;	/* for cancel only */
+};
+
+struct xdr_donate_cookie {
+	int32_t remaining;
+	int nseg;
+	int nalloc;
+	struct xdr_donate_alloc *allocs;
+	struct xdr_donate_seg segs[0];
+};
+
+static struct xdr_ioq_uv *
+xdr_ioq_uv_find_for_slice(struct xdr_ioq *xioq, const void *slice, size_t len)
+{
+	struct poolq_entry *have;
+	const uint8_t *p = slice;
+	const uint8_t *pend = p + len;
+
+	if (slice == NULL || len == 0)
+		return NULL;
+
+	TAILQ_FOREACH(have, &xioq->ioq_uv.uvqh.qh, q) {
+		struct xdr_ioq_uv *uv = IOQ_(have);
+		uint8_t *base = uv->v.vio_base;
+		uint8_t *wrap = uv->v.vio_wrap;
+
+		if (base == NULL || wrap == NULL)
+			continue;
+		if (p >= base && pend <= wrap)
+			return uv;
+	}
+	return NULL;
+}
+
+static struct xdr_donate_alloc *
+xdr_donate_alloc_get(struct xdr_donate_cookie *cookie, struct xdr_ioq_uv *uv)
+{
+	void *base = uv->v.vio_base;
+	size_t len = ioquv_size(uv);
+	int i;
+
+	for (i = 0; i < cookie->nalloc; i++) {
+		if (cookie->allocs[i].base == base)
+			return &cookie->allocs[i];
+	}
+	assert(cookie->nalloc < cookie->nseg);
+	i = cookie->nalloc++;
+	cookie->allocs[i].base = base;
+	cookie->allocs[i].len = len;
+	cookie->allocs[i].refs = 0;
+	return &cookie->allocs[i];
+}
+
+struct xdr_donate_cookie *
+xdr_ioq_donate_iovs(XDR *xdrs, const struct iovec *iov, int iovcnt)
+{
+	struct xdr_ioq *xioq;
+	struct xdr_donate_cookie *cookie;
+	size_t cookie_bytes;
+	int i;
+	int nseg = 0;
+
+	if (xdrs == NULL || iov == NULL || iovcnt <= 0)
+		return NULL;
+	if (xdrs->x_ops != &xdr_ioq_ops
+#ifdef USE_RPC_RDMA
+	    && xdrs->x_ops != &xdr_ioq_ops_rdma
+#endif
+	    )
+		return NULL;
+
+	xioq = XIOQ(xdrs);
+
+	for (i = 0; i < iovcnt; i++) {
+		if (iov[i].iov_base != NULL && iov[i].iov_len > 0)
+			nseg++;
+	}
+	if (nseg == 0)
+		return NULL;
+
+	/* Pre-validate every non-empty slice maps to a FREE (or already
+	 * DONATED) UV — all-or-nothing so we never partially donate.
+	 */
+	for (i = 0; i < iovcnt; i++) {
+		struct xdr_ioq_uv *uv;
+
+		if (iov[i].iov_base == NULL || iov[i].iov_len == 0)
+			continue;
+		uv = xdr_ioq_uv_find_for_slice(xioq, iov[i].iov_base,
+					      iov[i].iov_len);
+		if (uv == NULL)
+			return NULL;
+		if (!(uv->u.uio_flags & UIO_FLAG_FREE) &&
+		    !(uv->u.uio_flags & UIO_FLAG_DONATED))
+			return NULL;
+	}
+
+	cookie_bytes = sizeof(*cookie) + (size_t)nseg * sizeof(cookie->segs[0]);
+	cookie = mem_zalloc(cookie_bytes);
+	cookie->allocs = mem_zalloc((size_t)nseg * sizeof(*cookie->allocs));
+	cookie->nseg = nseg;
+	cookie->remaining = nseg;
+
+	nseg = 0;
+	for (i = 0; i < iovcnt; i++) {
+		struct xdr_ioq_uv *uv;
+		struct xdr_donate_alloc *alloc;
+
+		if (iov[i].iov_base == NULL || iov[i].iov_len == 0)
+			continue;
+
+		uv = xdr_ioq_uv_find_for_slice(xioq, iov[i].iov_base,
+					      iov[i].iov_len);
+		assert(uv != NULL);
+
+		alloc = xdr_donate_alloc_get(cookie, uv);
+		atomic_inc_int32_t(&alloc->refs);
+
+		/* Transfer ownership: destroy must not free_buffer. */
+		uv->u.uio_flags &= ~UIO_FLAG_FREE;
+		uv->u.uio_flags |= UIO_FLAG_DONATED;
+
+		cookie->segs[nseg].slice = iov[i].iov_base;
+		cookie->segs[nseg].slice_len = iov[i].iov_len;
+		cookie->segs[nseg].alloc = alloc;
+		cookie->segs[nseg].uv = uv;
+		nseg++;
+	}
+
+	__warnx(TIRPC_DEBUG_FLAG_XDR,
+		"%s() donated %d slices across %d allocs on xioq %p",
+		__func__, cookie->nseg, cookie->nalloc, xioq);
+	return cookie;
+}
+
+void
+xdr_ioq_donate_cancel(struct xdr_donate_cookie *cookie)
+{
+	int i;
+
+	if (cookie == NULL)
+		return;
+
+	for (i = 0; i < cookie->nseg; i++) {
+		struct xdr_ioq_uv *uv = cookie->segs[i].uv;
+
+		if (uv == NULL)
+			continue;
+		/* Restore malloc ownership for XDR_DESTROY. */
+		uv->u.uio_flags &= ~UIO_FLAG_DONATED;
+		uv->u.uio_flags |= UIO_FLAG_FREE;
+		cookie->segs[i].uv = NULL;
+	}
+	mem_free(cookie->allocs,
+		 (size_t)cookie->nseg * sizeof(*cookie->allocs));
+	mem_free(cookie,
+		 sizeof(*cookie) +
+		 (size_t)cookie->nseg * sizeof(cookie->segs[0]));
+}
+
+void
+xdr_ioq_donate_deleter(void *buf, size_t len, void *priv)
+{
+	struct xdr_donate_cookie *cookie = priv;
+	struct xdr_donate_seg *seg = NULL;
+	struct xdr_donate_alloc *alloc;
+	int32_t left;
+	int i;
+
+	if (cookie == NULL)
+		return;
+
+	for (i = 0; i < cookie->nseg; i++) {
+		if (cookie->segs[i].slice == buf &&
+		    cookie->segs[i].slice_len == len &&
+		    cookie->segs[i].alloc != NULL) {
+			seg = &cookie->segs[i];
+			break;
+		}
+	}
+	if (seg == NULL) {
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s() unknown slice %p len %zu in cookie %p",
+			__func__, buf, len, cookie);
+		return;
+	}
+
+	alloc = seg->alloc;
+	seg->alloc = NULL;
+	seg->uv = NULL; /* UV may already be destroyed */
+
+	left = atomic_dec_int32_t(&alloc->refs);
+	if (left == 0) {
+		__warnx(TIRPC_DEBUG_FLAG_XDR,
+			"%s() free donated alloc base %p len %zu",
+			__func__, alloc->base, alloc->len);
+		free_buffer(alloc->base, alloc->len);
+		alloc->base = NULL;
+	} else if (left < 0) {
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s() donate alloc ref underflow", __func__);
+		abort();
+	}
+
+	left = atomic_dec_int32_t(&cookie->remaining);
+	if (left == 0) {
+		mem_free(cookie->allocs,
+			 (size_t)cookie->nseg * sizeof(*cookie->allocs));
+		mem_free(cookie,
+			 sizeof(*cookie) +
+			 (size_t)cookie->nseg * sizeof(cookie->segs[0]));
+	} else if (left < 0) {
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s() donate cookie remaining underflow", __func__);
+		abort();
+	}
 }
 
 const struct xdr_ops xdr_ioq_ops = {
