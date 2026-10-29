@@ -66,4 +66,10 @@ void svc_zc_drain(SVCXPRT *xprt, bool have_writeq_lock, bool resume_writes);
 /** Destroy all parked ZC replies (xprt teardown). */
 void svc_zc_clear(struct rpc_dplx_rec *rec);
 
+/**
+ * True if EPOLLERR may be a MSG_ZEROCOPY ERRQUEUE wake (SO_ZEROCOPY enabled
+ * or in-flight/orphan ZC state). Otherwise EPOLLERR is a real socket error.
+ */
+bool svc_zc_errqueue_active(const SVCXPRT *xprt);
+
 #endif /* SVC_ZC_H */

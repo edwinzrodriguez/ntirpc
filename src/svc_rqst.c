@@ -1133,6 +1133,12 @@ svc_rqst_evchan_write(SVCXPRT *xprt, struct xdr_ioq *xioq, bool has_blocked)
 		__warnx(TIRPC_DEBUG_FLAG_ERROR,
 			"%s: failed evchan write control (%d)",
 			__func__, code);
+		/*
+		 * Do not SVC_DESTROY here: callers hold writeq.qmutex.
+		 * Destroy under that lock deadlocks other reply threads
+		 * blocked on the same mutex. Caller destroys after unlock
+		 * when CLOSE is set (see svc_ioq_write_impl).
+		 */
 	} else {
 		__warnx(TIRPC_DEBUG_FLAG_SVC_RQST,
 			"%s: create evchan write control fd pair (%d:%d)",
@@ -1639,15 +1645,30 @@ tls_dpr:
 #endif
 	/*
 	 * MSG_ZEROCOPY completions surface as EPOLLERR (error queue).
-	 * Drain before handling IN/OUT. Never write_resume inside this
-	 * drain — resume only after we know whether a SEND task will own
-	 * xioq_send (resume+free racing ioq_wpe.fun → NULL/UAF hang).
+	 * Without ZC interest, any EPOLLERR (alone or with IN/OUT) is a
+	 * real socket error — destroy immediately. Treating it as a ZC
+	 * wake (rearm + write_resume) leaves CLOSE|ADDED_SEND|IOQ_WRITING
+	 * stuck, storms failed rearms, and corrupts the work-pool
+	 * (NULL fun / TAILQ_REMOVE UAF). Real TCP errors often arrive as
+	 * ERR|IN or ERR|OUT, not ERR-only.
 	 *
-	 * EPOLLONESHOT is consumed by any delivered event (including
-	 * ERR-only); rearm when no RECV/SEND task will do it.
+	 * With ZC: drain before IN/OUT. Never write_resume inside drain —
+	 * resume only after we know whether a SEND task will own xioq_send.
+	 * EPOLLONESHOT is consumed by any delivered event; rearm when no
+	 * RECV/SEND task will do it.
 	 */
-	if (ev->events & EPOLLERR)
+	if (ev->events & EPOLLERR) {
+		if (!svc_zc_errqueue_active(&rec->xprt)) {
+			__warnx(TIRPC_DEBUG_FLAG_EVENT,
+				"%s: %p fd %d EPOLLERR without ZC (ev %08x); destroying",
+				__func__, &rec->xprt, rec->xprt.xp_fd,
+				ev->events);
+			SVC_DESTROY(&rec->xprt);
+			SVC_RELEASE(&rec->xprt, SVC_RELEASE_FLAG_NONE);
+			return NULL;
+		}
 		svc_zc_drain(&rec->xprt, false, false);
+	}
 
 	if (ev->events & EPOLLIN) {
 		/* This is a RECV event */
@@ -1674,7 +1695,7 @@ tls_dpr:
 		}
 	} else if (ev->events & EPOLLERR) {
 		/*
-		 * ZC completion only. EPOLLONESHOT disarmed only the fd that
+		 * ZC ERR-only: EPOLLONESHOT disarmed only the fd that
 		 * reported the event (RECV xp_fd vs SEND xp_fd_send). Clear
 		 * and rearm that direction alone — touching the sibling drops
 		 * a still-armed oneshot (flag clear + missed EPOLLIN) and
