@@ -90,6 +90,12 @@ void svc_zc_clear(struct rpc_dplx_rec *rec)
 	(void)rec;
 }
 
+bool svc_zc_errqueue_active(const SVCXPRT *xprt)
+{
+	(void)xprt;
+	return false;
+}
+
 #else /* HAVE_SO_ZEROCOPY */
 
 #ifndef SO_ZEROCOPY
@@ -588,19 +594,26 @@ svc_zc_recv_and_apply(SVCXPRT *xprt, struct poolq_head *doneq)
 	return false;
 }
 
+bool svc_zc_errqueue_active(const SVCXPRT *xprt)
+{
+	const struct rpc_dplx_rec *rec = REC_XPRT(xprt);
+
+	/*
+	 * Match svc_zc_drain()'s early-out: COPIED may clear SO_ZEROCOPY
+	 * while zcq / orphans still need ERRQUEUE wakes.
+	 */
+	return (xprt->xp_flags & SVC_XPRT_FLAG_SO_ZEROCOPY) ||
+	       rec->zcq.qcount > 0 || rec->zc_pending_bytes > 0 ||
+	       rec->zc_orphan_n > 0;
+}
+
 void svc_zc_drain(SVCXPRT *xprt, bool have_writeq_lock, bool resume_writes)
 {
 	struct rpc_dplx_rec *rec = REC_XPRT(xprt);
 	struct poolq_head doneq;
 	int n = 0;
 
-	/*
-	 * COPIED completions clear SVC_XPRT_FLAG_SO_ZEROCOPY so new sends
-	 * skip MSG_ZEROCOPY, but in-flight IDs still need ERRQUEUE drain.
-	 */
-	if (!(xprt->xp_flags & SVC_XPRT_FLAG_SO_ZEROCOPY) &&
-	    rec->zcq.qcount == 0 && rec->zc_pending_bytes == 0 &&
-	    rec->zc_orphan_n == 0)
+	if (!svc_zc_errqueue_active(xprt))
 		return;
 
 	TAILQ_INIT(&doneq.qh);

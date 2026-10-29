@@ -752,7 +752,20 @@ svc_rqst_rearm_events_locked(SVCXPRT *xprt, uint16_t ev_flags)
 	XPRT_AUTO_TRACEPOINT(xprt, rearm, TRACE_DEBUG,
 		"Rearm. ev_flags: {}", ev_flags);
 
-	const bool is_xprt_destroyed = xprt->xp_flags & (ev_flags | SVC_XPRT_FLAG_DESTROYED);
+	/*
+	 * Only SVC_XPRT_FLAG_DESTROYED means the xprt is gone. Historically
+	 * this also ORed ev_flags into the mask, so a SEND rearm while
+	 * ADDED_SEND was already set logged "is xprt destroyed = 1" and
+	 * returned error — which is wrong: already-armed is an idempotent
+	 * success (oneshot still waiting for EPOLLOUT). Treating it as
+	 * failure storms "failed evchan write control" under CLOSE|
+	 * ADDED_SEND|IOQ_WRITING and stalls fio (see ganesha.log).
+	 */
+	const bool is_xprt_destroyed =
+		(xprt->xp_flags & SVC_XPRT_FLAG_DESTROYED) != 0;
+	const bool already_armed =
+		!is_xprt_destroyed &&
+		((xprt->xp_flags & ev_flags) == ev_flags);
 	/* MUST follow the destroyed check above */
 	const bool is_rec_shutdown = !is_xprt_destroyed && (
 		sr_rec->ev_flags & SVC_RQST_FLAG_SHUTDOWN);
@@ -773,10 +786,17 @@ svc_rqst_rearm_events_locked(SVCXPRT *xprt, uint16_t ev_flags)
 	if (is_xprt_destroyed || is_rec_shutdown) {
 		__warnx(TIRPC_DEBUG_FLAG_WARN,
 			"%s: %p fd %d, xp_flags %x, xp_refcnt %" PRId32
-			"is xprt destroyed = %d, is_rec_shutdown = %d",
+			" destroyed=%d shutdown=%d (skip rearm)",
 			__func__, rec, rec->xprt.xp_fd, rec->xprt.xp_flags,
 			rec->xprt.xp_refcnt, is_xprt_destroyed, is_rec_shutdown);
 		return (1);
+	}
+	if (already_armed) {
+		__warnx(TIRPC_DEBUG_FLAG_SVC_RQST,
+			"%s: %p fd %d xp_flags %x already armed for %x (ok)",
+			__func__, rec, rec->xprt.xp_fd, rec->xprt.xp_flags,
+			ev_flags);
+		return (0);
 	}
 
 	/* Don't take a ref on the xprt.  We take a ref in hook, and release it
@@ -1133,6 +1153,12 @@ svc_rqst_evchan_write(SVCXPRT *xprt, struct xdr_ioq *xioq, bool has_blocked)
 		__warnx(TIRPC_DEBUG_FLAG_ERROR,
 			"%s: failed evchan write control (%d)",
 			__func__, code);
+		/*
+		 * Do not SVC_DESTROY here: callers hold writeq.qmutex.
+		 * Destroy under that lock deadlocks other reply threads
+		 * blocked on the same mutex. Caller destroys after unlock
+		 * when CLOSE is set (see svc_ioq_write_impl).
+		 */
 	} else {
 		__warnx(TIRPC_DEBUG_FLAG_SVC_RQST,
 			"%s: create evchan write control fd pair (%d:%d)",
@@ -1639,15 +1665,30 @@ tls_dpr:
 #endif
 	/*
 	 * MSG_ZEROCOPY completions surface as EPOLLERR (error queue).
-	 * Drain before handling IN/OUT. Never write_resume inside this
-	 * drain — resume only after we know whether a SEND task will own
-	 * xioq_send (resume+free racing ioq_wpe.fun → NULL/UAF hang).
+	 * Without ZC interest, any EPOLLERR (alone or with IN/OUT) is a
+	 * real socket error — destroy immediately. Treating it as a ZC
+	 * wake (rearm + write_resume) leaves CLOSE|ADDED_SEND|IOQ_WRITING
+	 * stuck, storms failed rearms, and corrupts the work-pool
+	 * (NULL fun / TAILQ_REMOVE UAF). Real TCP errors often arrive as
+	 * ERR|IN or ERR|OUT, not ERR-only.
 	 *
-	 * EPOLLONESHOT is consumed by any delivered event (including
-	 * ERR-only); rearm when no RECV/SEND task will do it.
+	 * With ZC: drain before IN/OUT. Never write_resume inside drain —
+	 * resume only after we know whether a SEND task will own xioq_send.
+	 * EPOLLONESHOT is consumed by any delivered event; rearm when no
+	 * RECV/SEND task will do it.
 	 */
-	if (ev->events & EPOLLERR)
+	if (ev->events & EPOLLERR) {
+		if (!svc_zc_errqueue_active(&rec->xprt)) {
+			__warnx(TIRPC_DEBUG_FLAG_EVENT,
+				"%s: %p fd %d EPOLLERR without ZC (ev %08x); destroying",
+				__func__, &rec->xprt, rec->xprt.xp_fd,
+				ev->events);
+			SVC_DESTROY(&rec->xprt);
+			SVC_RELEASE(&rec->xprt, SVC_RELEASE_FLAG_NONE);
+			return NULL;
+		}
 		svc_zc_drain(&rec->xprt, false, false);
+	}
 
 	if (ev->events & EPOLLIN) {
 		/* This is a RECV event */
@@ -1674,7 +1715,7 @@ tls_dpr:
 		}
 	} else if (ev->events & EPOLLERR) {
 		/*
-		 * ZC completion only. EPOLLONESHOT disarmed only the fd that
+		 * ZC ERR-only: EPOLLONESHOT disarmed only the fd that
 		 * reported the event (RECV xp_fd vs SEND xp_fd_send). Clear
 		 * and rearm that direction alone — touching the sibling drops
 		 * a still-armed oneshot (flag clear + missed EPOLLIN) and

@@ -205,7 +205,14 @@ work_pool_thread(void *arg)
 			__warnx(TIRPC_DEBUG_FLAG_WORKER,
 				"%s() %s task %p",
 				__func__, wpt->worker_name, wpt->work);
-			wpt->work->fun(wpt->work);
+			if (unlikely(wpt->work->fun == NULL)) {
+				__warnx(TIRPC_DEBUG_FLAG_ERROR,
+					"%s() %s NULL fun on work %p (UAF?)",
+					__func__, wpt->worker_name,
+					wpt->work);
+			} else {
+				wpt->work->fun(wpt->work);
+			}
 			wpt->work = NULL;
 			pthread_mutex_lock(&pool->pqh.qmutex);
 		}

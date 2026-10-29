@@ -497,6 +497,8 @@ static void svc_ioq_write_impl(SVCXPRT *xprt, bool et_retry)
 			/* Remaining queued replies are completed in writeq clear */
 			break;
 		} else if (rc == EWOULDBLOCK){
+			int ev_code;
+
 			__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
 				"%s: %p fd %d EWOULDBLOCK",
 				__func__, xprt, xprt->xp_fd);
@@ -506,11 +508,29 @@ static void svc_ioq_write_impl(SVCXPRT *xprt, bool et_retry)
 				xprt, write_would_block,
 				TRACE_DEBUG, "Write got EWOULDBLOCK.");
 
-			svc_rqst_evchan_write(xprt, xioq, has_blocked);
+			/*
+			 * Do not treat SVC_XPRT_FLAG_CLOSE as "shutting down".
+			 * CLOSE is set at TCP xprt create and means "close the
+			 * fd when destroyed". Checking it here destroyed the
+			 * xprt on every socket-buffer stall (EAGAIN during
+			 * large READ replies), causing reconnect storms.
+			 * DESTROYED is already handled above; arm EPOLLOUT.
+			 */
+			ev_code = svc_rqst_evchan_write(xprt, xioq,
+							has_blocked);
 
 			XPRT_UNIQUE_AUTO_TRACEPOINT(xprt, mutex_unlock,
 				TRACE_DEBUG, "Unlocking mutex");
 			mutex_unlock(&rec->writeq.qmutex);
+			/*
+			 * Real SEND arm/rearm failure (not already-armed):
+			 * destroy after releasing writeq — SVC_DESTROY under
+			 * the mutex deadlocks reply threads on qmutex.
+			 */
+			if (unlikely(ev_code)) {
+				destroy_xprt = true;
+				break;
+			}
 			blocked = true;
 			break;
 		} else {
