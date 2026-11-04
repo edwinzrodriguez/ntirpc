@@ -945,8 +945,10 @@ svc_vc_ncreate(const int fd, const u_int sendsize, const u_int recvsize)
 /**
  * Enable header staging for upper-layer WRITE payload alloc.
  * Large LAST_FRAG bodies beyond @p hdr_stage_max stay on the socket as
- * sx_body_remain until xdr_ioq_fill_payload readvs them (or drain after
- * the request if unused). @p hdr_stage_max 0 selects the default (256KiB).
+ * sx_body_remain until xdr_ioq_fill_payload readvs them (including any
+ * trailing compound bytes after the WRITE opaque). Leftover after a failed
+ * decode is drained; a failed drain destroys the xprt. @p hdr_stage_max 0
+ * selects the default (256KiB).
  */
 void svc_vc_set_payload_defer(SVCXPRT *xprt, bool enable, u_int hdr_stage_max);
 
@@ -961,8 +963,13 @@ uint32_t svc_vc_body_remain(SVCXPRT *xprt);
 ssize_t svc_vc_readv_body(SVCXPRT *xprt, struct iovec *iov, int iovcnt,
 			  size_t iov_off, size_t nbytes);
 
-/** Recv any leftover sx_body_remain into a throwaway buffer (stream sync). */
-void svc_vc_drain_body_remain(SVCXPRT *xprt);
+/**
+ * Recv any leftover sx_body_remain into a throwaway buffer (stream sync).
+ * @return true if the socket body was fully discarded (or none remained).
+ *         false if read failed — sx_body_remain is left unchanged so the
+ *         caller can destroy the xprt rather than desync the stream.
+ */
+bool svc_vc_drain_body_remain(SVCXPRT *xprt);
 
 extern SVCXPRT *svc_dg_ncreatef(const int, const u_int, const u_int,
 				const uint32_t);

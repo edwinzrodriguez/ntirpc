@@ -1494,8 +1494,22 @@ again:
 	if (xd->sx_body_remain) {
 		enum xprt_stat st = svc_request(xprt, xioq->xdrs);
 
-		if (xd->sx_body_remain)
-			svc_vc_drain_body_remain(xprt);
+		/*
+		 * Decode may leave deferred body (fill failed) or pull it
+		 * into the stream (trailing compound ops). Any leftover must
+		 * be discarded before EPOLLIN is rearmed; a failed drain
+		 * means the TCP stream is desynced — destroy rather than
+		 * clear the counter and continue.
+		 */
+		if (xd->sx_body_remain) {
+			if (!svc_vc_drain_body_remain(xprt)) {
+				__warnx(TIRPC_DEBUG_FLAG_ERROR,
+					"%s: %p fd %d body drain failed (will set dead)",
+					__func__, xprt, xprt->xp_fd);
+				SVC_DESTROY(xprt);
+				return SVC_STAT(xprt);
+			}
+		}
 
 		if (unlikely(svc_rqst_rearm_events(
 				     xprt, SVC_XPRT_FLAG_ADDED_RECV))) {
@@ -1828,14 +1842,14 @@ svc_vc_readv_body(SVCXPRT *xprt, struct iovec *iov, int iovcnt,
 	return (ssize_t)total;
 }
 
-void
+bool
 svc_vc_drain_body_remain(SVCXPRT *xprt)
 {
 	struct svc_vc_xprt *xd;
 	char buf[65536];
 
 	if (xprt == NULL || xprt->xp_type != XPRT_TCP)
-		return;
+		return true;
 
 	xd = VC_DR(REC_XPRT(xprt));
 	while (xd->sx_body_remain > 0) {
@@ -1850,12 +1864,13 @@ svc_vc_drain_body_remain(SVCXPRT *xprt)
 
 			if (n < 0) {
 				__warnx(TIRPC_DEBUG_FLAG_ERROR,
-					"%s: %p fd %d drain failed remain %u",
+					"%s: %p fd %d drain failed remain %u errno %d",
 					__func__, xprt, xprt->xp_fd,
-					xd->sx_body_remain);
-				xd->sx_body_remain = 0;
-				return;
+					xd->sx_body_remain, errno);
+				/* Leave remain set — caller must destroy. */
+				return false;
 			}
 		}
 	}
+	return true;
 }

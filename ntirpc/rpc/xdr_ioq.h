@@ -265,12 +265,15 @@ bool xdr_ioq_has_payload_alloc(XDR *xdrs);
  * Calls @c payload_alloc for @p data_len bytes, copies any body already
  * buffered at @p start, then readvs any VC-deferred remainder from the
  * socket. Appends @c UIO_FLAG_UPPER UVs for deferred bytes so SETPOS past
- * RNDUP(@p data_len) succeeds. On success, @p iov_out / @p cookie_out / @p release_out are owned by the
+ * RNDUP(@p data_len) succeeds, then pulls any trailing deferred bytes
+ * (compound ops after WRITE) into a FREE UV for continued decode. On
+ * success, @p iov_out / @p cookie_out / @p release_out are owned by the
  * caller (do not free_buffer the iov bases). Call @p release_out(@p cookie_out)
  * if ownership is not transferred to the FSAL write path.
  *
- * @return false if no callback, alloc failure, or I/O error — caller should
- *         fall back to XDR_FILLBUFS / donate-claim.
+ * @return false if no callback, alloc failure, or I/O error — when a
+ *         payload_alloc callback is registered, callers must not fall back
+ *         to XDR_FILLBUFS (deferred body is not visible to IOVCOUNT).
  */
 bool xdr_ioq_fill_payload(XDR *xdrs, u_int start, u_int data_len,
 			  struct iovec **iov_out, int *iovcnt_out,

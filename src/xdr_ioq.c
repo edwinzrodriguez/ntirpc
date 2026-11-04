@@ -2343,7 +2343,7 @@ xdr_ioq_fill_payload(XDR *xdrs, u_int start, u_int data_len,
 	if (!xioq->payload_alloc(xioq->payload_alloc_ctx, data_len, &iov,
 				 &iovcnt, &cookie, &release) ||
 	    iov == NULL || iovcnt <= 0 || cookie == NULL) {
-		__warnx(TIRPC_DEBUG_FLAG_XDR,
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
 			"%s() payload_alloc failed for %u bytes",
 			__func__, data_len);
 		return false;
@@ -2368,8 +2368,9 @@ xdr_ioq_fill_payload(XDR *xdrs, u_int start, u_int data_len,
 		nread = svc_vc_readv_body(xprt, iov, iovcnt, copied, remain);
 		if (nread < 0 || (size_t)nread != remain) {
 			__warnx(TIRPC_DEBUG_FLAG_ERROR,
-				"%s() readv body got %zd want %zu",
-				__func__, nread, remain);
+				"%s() readv body got %zd want %zu errno %d body_remain %u",
+				__func__, nread, remain, errno,
+				xprt ? svc_vc_body_remain(xprt) : 0);
 			goto fail_release;
 		}
 		/* Append UPPER UVs for deferred bytes so SETPOS can walk them. */
@@ -2442,6 +2443,51 @@ xdr_ioq_fill_payload(XDR *xdrs, u_int start, u_int data_len,
 			TAILQ_INSERT_TAIL(&xioq->ioq_uv.uvqh.qh, &uv->uvq, q);
 			pad_heap = NULL; /* owned by uv */
 		}
+	}
+
+	/*
+	 * Trailing compound content (e.g. GETATTR after WRITE) is still on
+	 * the socket as sx_body_remain. Pull it into a FREE UV so subsequent
+	 * XDR decode can see it. Leaving it deferred causes CHECKSUM/decode
+	 * failure, then FILLBUFS fallback treats IOVCOUNT -1 as a huge
+	 * unsigned and the stream desyncs.
+	 */
+	if (xprt != NULL && svc_vc_body_remain(xprt) > 0) {
+		uint32_t left = svc_vc_body_remain(xprt);
+		void *trail = alloc_buffer(left);
+		struct iovec tiov = { .iov_base = trail, .iov_len = left };
+		struct xdr_ioq_uv *uv;
+
+		if (trail == NULL) {
+			__warnx(TIRPC_DEBUG_FLAG_ERROR,
+				"%s() alloc %u trailing body bytes failed",
+				__func__, left);
+			goto fail_release;
+		}
+		nread = svc_vc_readv_body(xprt, &tiov, 1, 0, left);
+		if (nread < 0 || (size_t)nread != left) {
+			__warnx(TIRPC_DEBUG_FLAG_ERROR,
+				"%s() trailing body readv got %zd want %u errno %d",
+				__func__, nread, left, errno);
+			free_buffer(trail, left);
+			goto fail_release;
+		}
+		uv = mem_zalloc(sizeof(*uv));
+		if (uv == NULL) {
+			free_buffer(trail, left);
+			goto fail_release;
+		}
+		TAILQ_INIT_ENTRY(&uv->uvq, q);
+		uv->u.uio_flags = UIO_FLAG_FREE;
+		uv->u.uio_references = 1;
+		uv->v.vio_base = trail;
+		uv->v.vio_head = trail;
+		uv->v.vio_tail = (char *)trail + left;
+		uv->v.vio_wrap = uv->v.vio_tail;
+		uv->v.vio_length = left;
+		uv->v.vio_type = VIO_DATA;
+		(xioq->ioq_uv.uvqh.qcount)++;
+		TAILQ_INSERT_TAIL(&xioq->ioq_uv.uvqh.qh, &uv->uvq, q);
 	}
 
 	*iov_out = iov;
