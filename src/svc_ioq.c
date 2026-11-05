@@ -509,6 +509,14 @@ static void svc_ioq_write_impl(SVCXPRT *xprt, bool et_retry)
 				TRACE_DEBUG, "Write got EWOULDBLOCK.");
 
 			/*
+			 * Drop IOQ_FLAG_WORKING before arming EPOLLOUT so the
+			 * SEND oneshot can set WORKING itself. clear_requests
+			 * is still blocked by IOQ_WRITING until we return.
+			 */
+			atomic_clear_uint16_t_bits(&xioq->ioq_s.qflags,
+						   IOQ_FLAG_WORKING);
+
+			/*
 			 * Do not treat SVC_XPRT_FLAG_CLOSE as "shutting down".
 			 * CLOSE is set at TCP xprt create and means "close the
 			 * fd when destroyed". Checking it here destroyed the
@@ -609,6 +617,11 @@ svc_ioq_write_callback(struct work_pool_entry *wpe)
 	struct xdr_ioq *xioq = opr_containerof(wpe, struct xdr_ioq, ioq_wpe);
 
 	svc_ioq_write(xioq->xdrs[0].x_lib[1]);
+	/*
+	 * May already be clear after EWOULDBLOCK (EPOLLOUT owns WORKING).
+	 * Otherwise release so clear_requests can reclaim the reply xioq.
+	 */
+	atomic_clear_uint16_t_bits(&xioq->ioq_s.qflags, IOQ_FLAG_WORKING);
 }
 
 
@@ -661,7 +674,18 @@ svc_ioq_write_submit(SVCXPRT *xprt, struct xdr_ioq *xioq)
 	const bool need_processing = add_ioq_to_write_queue(xprt, xioq);
 
 	if (need_processing) {
-		/* Schedule work to process output for this duplex record. */
+		/*
+		 * Mark WORKING before enqueue so clear_requests (unlink on
+		 * destroy) waits — otherwise it XDR_DESTROYs this xioq while
+		 * ioq_wpe is still on the work pool (TAILQ UAF / NULL fun).
+		 */
+		if (unlikely(atomic_postset_uint16_t_bits(
+				     &xioq->ioq_s.qflags, IOQ_FLAG_WORKING) &
+			     IOQ_FLAG_WORKING)) {
+			__warnx(TIRPC_DEBUG_FLAG_ERROR,
+				"%s: %p fd %d xioq %p already WORKING",
+				__func__, xprt, xprt->xp_fd, xioq);
+		}
 		xioq->ioq_wpe.fun = svc_ioq_write_callback;
 		work_pool_submit(&svc_work_pool, &xioq->ioq_wpe);
 	}
