@@ -949,6 +949,10 @@ svc_vc_ncreate(const int fd, const u_int sendsize, const u_int recvsize)
  * trailing compound bytes after the WRITE opaque). Leftover after a failed
  * decode is drained; a failed drain destroys the xprt. @p hdr_stage_max 0
  * selects the default (256KiB).
+ *
+ * Enable at TCP accept (before the first recv). Turning it on mid-request
+ * after EPOLLIN was rearmed races a concurrent recv into body_remain and
+ * can hang a worker in drain.
  */
 void svc_vc_set_payload_defer(SVCXPRT *xprt, bool enable, u_int hdr_stage_max);
 

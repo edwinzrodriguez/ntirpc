@@ -105,6 +105,9 @@ static void svc_vc_override_ops(SVCXPRT *, SVCXPRT *);
 
 #define LAST_FRAG ((u_int32_t)(1 << 31))
 
+/* Max wait for deferred body readv (ms). Avoids mount hang on raced drain. */
+#define SVC_VC_BODY_POLL_MS 30000
+
 /*
  * Usage:
  * xprt = svc_vc_ncreate(sock, send_buf_size, recv_buf_size);
@@ -1818,15 +1821,29 @@ svc_vc_readv_body(SVCXPRT *xprt, struct iovec *iov, int iovcnt,
 			if (errno == EINTR)
 				continue;
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				/* Blocking wait for deferred body. */
+				/*
+				 * Wait for deferred body, but never forever:
+				 * a raced concurrent recv can steal the bytes
+				 * and leave us hung across a mount/client stall.
+				 */
 				struct pollfd pfd = {
 					.fd = xprt->xp_fd,
 					.events = POLLIN,
 				};
+				int pr = poll(&pfd, 1, SVC_VC_BODY_POLL_MS);
 
-				if (poll(&pfd, 1, -1) < 0) {
+				if (pr < 0) {
 					if (errno == EINTR)
 						continue;
+					return -1;
+				}
+				if (pr == 0) {
+					errno = ETIMEDOUT;
+					__warnx(TIRPC_DEBUG_FLAG_ERROR,
+						"%s: %p fd %d body poll timeout remain %u want %zu got %zu",
+						__func__, xprt, xprt->xp_fd,
+						xd->sx_body_remain, nbytes,
+						total);
 					return -1;
 				}
 				continue;
