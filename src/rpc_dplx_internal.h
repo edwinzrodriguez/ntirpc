@@ -52,11 +52,25 @@ typedef struct rpc_dplx_lock {
 
 struct svc_rqst_rec;
 
+/** Completions that arrived before the matching ioq was on zcq */
+#define RPC_DPLX_ZC_ORPHAN_MAX 256
+
 /* new unified state */
 struct rpc_dplx_rec {
 	struct svc_xprt xprt;		/**< Transport Independent handle */
 	struct xdr_ioq ioq;
 	struct poolq_head writeq;	/**< poolq for write requests */
+	/**
+	 * Replies awaiting MSG_ZEROCOPY ERRQUEUE completion.
+	 * Protected by writeq.qmutex; entries use xdr_ioq.zc_s (not ioq_s).
+	 */
+	struct poolq_head zcq;
+	/** Next send ID the kernel will assign on a successful MSG_ZEROCOPY */
+	uint32_t zc_next_id;
+	/** Outstanding ZC payload bytes (pinned until completion) */
+	uint32_t zc_pending_bytes;
+	uint32_t zc_orphan[RPC_DPLX_ZC_ORPHAN_MAX];
+	unsigned zc_orphan_n;
 	struct opr_rbtree call_replies;
 	struct opr_rbtree rdma_call_expires;	/**< call expiration tree for RDMA */
 	struct opr_rbtree_node fd_node;
@@ -130,6 +144,11 @@ rpc_dplx_rec_init(struct rpc_dplx_rec *rec)
 	TAILQ_INIT(&rec->writeq.qh);
 	mutex_init(&rec->writeq.qmutex, NULL);
 	rec->writeq.qcount = 0;
+	TAILQ_INIT(&rec->zcq.qh);
+	rec->zcq.qcount = 0;
+	rec->zc_next_id = 0;
+	rec->zc_pending_bytes = 0;
+	rec->zc_orphan_n = 0;
 	/* Stop this xprt being cleaned immediately */
 	(void)clock_gettime(CLOCK_MONOTONIC_FAST, &(rec->recv.ts));
 

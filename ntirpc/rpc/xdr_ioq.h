@@ -120,7 +120,8 @@ struct xdr_ioq_uv_head {
 struct xdr_ioq {
 	XDR xdrs[1];
 	struct work_pool_entry ioq_wpe;
-	struct poolq_entry ioq_s;	/* segment of stream */
+	struct poolq_entry ioq_s;	/* segment of stream (writeq / stream) */
+	struct poolq_entry zc_s;	/* MSG_ZEROCOPY zcq only — not ioq_s */
 	pthread_cond_t ioq_cond;
 	struct poolq_head *ioq_pool;
 	struct xdr_ioq_uv_head ioq_uv;	/* header/vectors */
@@ -128,7 +129,19 @@ struct xdr_ioq {
 	uint64_t id;
 	uint32_t write_start; /* Position to start write at */
 	int frag_hdr_bytes_sent; /* Indicates a fragment header has been sent */
+	/**
+	 * RPC record-mark header in network order. MSG_ZEROCOPY may pin this
+	 * until ERRQUEUE completion — must not live on flushv's stack.
+	 */
+	uint32_t frag_hdr_be;
 	bool has_blocked;
+	/** MSG_ZEROCOPY: first/last kernel send IDs (inclusive); UINT32_MAX = none */
+	uint32_t zc_id_lo;
+	uint32_t zc_id_hi;
+	uint32_t zc_ids_done;
+	uint32_t zc_bytes;	/* payload bytes covered by outstanding ZC sends */
+	bool zc_tracked;	/* on zcq for ID matching (may still be flushing) */
+	bool zc_awaiting;	/* flush done; OK to XDR_DESTROY when IDs complete */
 
 	/*
 	 * Reply timing cookie copied from svc_req before async send.
@@ -153,6 +166,7 @@ struct xdr_ioq {
 };
 
 #define _IOQ(p) (opr_containerof((p), struct xdr_ioq, ioq_s))
+#define _ZC_IOQ(p) (opr_containerof((p), struct xdr_ioq, zc_s))
 #define XIOQ(p) (opr_containerof((p), struct xdr_ioq, xdrs))
 
 /* avoid conflicts with UIO_FLAG */
