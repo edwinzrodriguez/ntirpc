@@ -82,7 +82,10 @@
 #include "svc_xprt.h"
 #include "rpc_dplx_internal.h"
 #include "svc_ioq.h"
+#include "svc_zc.h"
+#ifdef USE_TLS
 #include "tls.h"
+#endif
 
 static void svc_vc_rendezvous_ops(SVCXPRT *);
 static void svc_vc_override_ops(SVCXPRT *, SVCXPRT *);
@@ -535,6 +538,8 @@ svc_vc_rendezvous(SVCXPRT *xprt)
 		len = 1;
 		(void) setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &len,
 				  sizeof(len));
+		/* Optional SO_ZEROCOPY for MSG_ZEROCOPY TX (TCP). */
+		svc_zc_try_enable(newxprt, fd);
 	}
 
 	/* set SO_SNDTIMEO to deal with bad clients */

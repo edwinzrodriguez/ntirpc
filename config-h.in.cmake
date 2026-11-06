@@ -24,6 +24,7 @@
 #cmakedefine USE_TLS 1
 #cmakedefine USE_OPENSSL 1
 #cmakedefine USE_GNUTLS 1
+#cmakedefine HAVE_SO_ZEROCOPY 1
 
 /* Package stuff */
 #define PACKAGE "libntirpc"

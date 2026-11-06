@@ -72,6 +72,7 @@ svc_stage_now_ns(void)
 #include "svc_xprt.h"
 #include <rpc/svc_auth.h>
 #include "svc_ioq.h"
+#include "svc_zc.h"
 
 #ifdef USE_RPC_RDMA
 #include "rpc_rdma.h"
@@ -104,6 +105,11 @@ svc_stage_now_ns(void)
 /* svc_epoll_data is used as the data for svc fd event in epoll.
  * It enables a direct access to the fd and unique_id, and to
  * serialize/deserialize the struct into the event format.
+ *
+ * Both xp_fd (RECV) and xp_fd_send (SEND) store the primary fd for
+ * xprt lookup. The high bit of unique_id marks the SEND registration so
+ * EPOLLERR-only can rearm only the oneshot that actually fired — clearing
+ * the sibling arm drops live EPOLLIN/EPOLLOUT and hangs the xprt under ZC.
  */
 union svc_epoll_data {
 	struct {
@@ -117,6 +123,20 @@ static_assert(sizeof(union svc_epoll_data) == sizeof(union epoll_data),
 		"incorrect size for svc_epoll_data");
 
 #define SVC_NO_XPRT_UNIQUE_ID	0
+#define SVC_EPOLL_UNIQUE_ID_MASK	0x7fffffffu
+#define SVC_EPOLL_SEND_BIT		0x80000000u
+
+static inline uint32_t
+svc_epoll_unique_id(uint32_t packed)
+{
+	return packed & SVC_EPOLL_UNIQUE_ID_MASK;
+}
+
+static inline bool
+svc_epoll_is_send(uint32_t packed)
+{
+	return (packed & SVC_EPOLL_SEND_BIT) != 0;
+}
 
 static uint32_t round_robin;
 /*static*/ uint32_t wakeups;
@@ -732,7 +752,20 @@ svc_rqst_rearm_events_locked(SVCXPRT *xprt, uint16_t ev_flags)
 	XPRT_AUTO_TRACEPOINT(xprt, rearm, TRACE_DEBUG,
 		"Rearm. ev_flags: {}", ev_flags);
 
-	const bool is_xprt_destroyed = xprt->xp_flags & (ev_flags | SVC_XPRT_FLAG_DESTROYED);
+	/*
+	 * Only SVC_XPRT_FLAG_DESTROYED means the xprt is gone. Historically
+	 * this also ORed ev_flags into the mask, so a SEND rearm while
+	 * ADDED_SEND was already set logged "is xprt destroyed = 1" and
+	 * returned error — which is wrong: already-armed is an idempotent
+	 * success (oneshot still waiting for EPOLLOUT). Treating it as
+	 * failure storms "failed evchan write control" under CLOSE|
+	 * ADDED_SEND|IOQ_WRITING and stalls fio (see ganesha.log).
+	 */
+	const bool is_xprt_destroyed =
+		(xprt->xp_flags & SVC_XPRT_FLAG_DESTROYED) != 0;
+	const bool already_armed =
+		!is_xprt_destroyed &&
+		((xprt->xp_flags & ev_flags) == ev_flags);
 	/* MUST follow the destroyed check above */
 	const bool is_rec_shutdown = !is_xprt_destroyed && (
 		sr_rec->ev_flags & SVC_RQST_FLAG_SHUTDOWN);
@@ -753,10 +786,17 @@ svc_rqst_rearm_events_locked(SVCXPRT *xprt, uint16_t ev_flags)
 	if (is_xprt_destroyed || is_rec_shutdown) {
 		__warnx(TIRPC_DEBUG_FLAG_WARN,
 			"%s: %p fd %d, xp_flags %x, xp_refcnt %" PRId32
-			"is xprt destroyed = %d, is_rec_shutdown = %d",
+			" destroyed=%d shutdown=%d (skip rearm)",
 			__func__, rec, rec->xprt.xp_fd, rec->xprt.xp_flags,
 			rec->xprt.xp_refcnt, is_xprt_destroyed, is_rec_shutdown);
 		return (1);
+	}
+	if (already_armed) {
+		__warnx(TIRPC_DEBUG_FLAG_SVC_RQST,
+			"%s: %p fd %d xp_flags %x already armed for %x (ok)",
+			__func__, rec, rec->xprt.xp_fd, rec->xprt.xp_flags,
+			ev_flags);
+		return (0);
 	}
 
 	/* Don't take a ref on the xprt.  We take a ref in hook, and release it
@@ -866,10 +906,6 @@ svc_rqst_hook_events(struct rpc_dplx_rec *rec, struct svc_rqst_rec *sr_rec,
 		     uint16_t ev_flags)
 {
 	int code = EINVAL;
-	const union svc_epoll_data ev_data = {
-			.data.fd = rec->xprt.xp_fd,
-			.data.unique_id = rec->xprt.xp_unique_id};
-
 	XPRT_AUTO_TRACEPOINT(&rec->xprt, hook, TRACE_DEBUG,
 		"Hook. ev_flags: {}", ev_flags);
 
@@ -902,6 +938,11 @@ svc_rqst_hook_events(struct rpc_dplx_rec *rec, struct svc_rqst_rec *sr_rec,
 		 * epoll, with no consequences. */
 
 		if (ev_flags & SVC_XPRT_FLAG_ADDED_RECV) {
+			const union svc_epoll_data ev_data = {
+				.data.fd = rec->xprt.xp_fd,
+				.data.unique_id = rec->xprt.xp_unique_id
+			};
+
 			ev = &rec->ev_u.epoll.event_recv;
 
 			/* set up epoll user data */
@@ -942,9 +983,15 @@ svc_rqst_hook_events(struct rpc_dplx_rec *rec, struct svc_rqst_rec *sr_rec,
 		}
 
 		if (ev_flags & SVC_XPRT_FLAG_ADDED_SEND) {
+			const union svc_epoll_data ev_data = {
+				.data.fd = rec->xprt.xp_fd,
+				.data.unique_id = rec->xprt.xp_unique_id |
+						  SVC_EPOLL_SEND_BIT
+			};
+
 			ev = &rec->ev_u.epoll.event_send;
 
-			/* set up epoll user data.  Lookup needs the primary FD */
+			/* Lookup needs the primary FD; SEND bit marks duplex */
 			ev->data.u64 = ev_data.serialized_data;
 
 			/* wait for write events, edge triggered, oneshot */
@@ -1106,6 +1153,12 @@ svc_rqst_evchan_write(SVCXPRT *xprt, struct xdr_ioq *xioq, bool has_blocked)
 		__warnx(TIRPC_DEBUG_FLAG_ERROR,
 			"%s: failed evchan write control (%d)",
 			__func__, code);
+		/*
+		 * Do not SVC_DESTROY here: callers hold writeq.qmutex.
+		 * Destroy under that lock deadlocks other reply threads
+		 * blocked on the same mutex. Caller destroys after unlock
+		 * when CLOSE is set (see svc_ioq_write_impl).
+		 */
 	} else {
 		__warnx(TIRPC_DEBUG_FLAG_SVC_RQST,
 			"%s: create evchan write control fd pair (%d:%d)",
@@ -1296,6 +1349,7 @@ svc_rqst_xprt_unregister(SVCXPRT *xprt, uint32_t flags)
 	}
 	svc_rqst_unreg(rec, sr_rec);
 	clear_requests(rec);
+	svc_zc_clear(rec);
 }
 
 #if defined(USE_RPC_RDMA)
@@ -1580,15 +1634,17 @@ svc_rqst_epoll_event(struct svc_rqst_rec *sr_rec, struct epoll_event *ev)
 	}
 	/* At this point, we have a ref on the xprt, and know it's valid */
 	/* verify that indeed this is the xprt as of the event. */
-	if (ev_data.data.unique_id != xprt->xp_unique_id) {
+	if (svc_epoll_unique_id(ev_data.data.unique_id) !=
+	    xprt->xp_unique_id) {
 		NTIRPC_AUTO_TRACEPOINT(xprt, unique_id_mismatch, TRACE_INFO,
 				"xprt for fd = {} found with unique_id = {}, but event unique_id = {}",
 				ev_data.data.fd, xprt->xp_unique_id,
-				ev_data.data.unique_id);
+				svc_epoll_unique_id(ev_data.data.unique_id));
 		__warnx(TIRPC_DEBUG_FLAG_ERROR,
 			"%s: event fd %d with xp_unique_id %" PRIu32
 			" differs from of xp_unique_id %" PRIu32 " of xprt %p. Release and ignore",
-			__func__, ev_data.data.fd, ev_data.data.unique_id,
+			__func__, ev_data.data.fd,
+			svc_epoll_unique_id(ev_data.data.unique_id),
 			xprt->xp_unique_id, xprt);
 		SVC_RELEASE(xprt, SVC_RELEASE_FLAG_NONE);
 		return (NULL);
@@ -1597,15 +1653,43 @@ svc_rqst_epoll_event(struct svc_rqst_rec *sr_rec, struct epoll_event *ev)
 	rec = REC_XPRT(xprt);
 
 	__warnx(TIRPC_DEBUG_FLAG_SVC_RQST,
-		"%s: event %p %08x%s%s rpc_dplx_rec %p (sr_rec %p)",
+		"%s: event %p %08x%s%s%s rpc_dplx_rec %p (sr_rec %p)",
 		__func__, ev, ev->events,
 		ev->events & EPOLLIN ? " RECV" : "",
 		ev->events & EPOLLOUT ? " SEND" : "",
+		ev->events & EPOLLERR ? " ERR" : "",
 		rec, sr_rec);
 
 #if USE_TLS
 tls_dpr:
 #endif
+	/*
+	 * MSG_ZEROCOPY completions surface as EPOLLERR (error queue).
+	 * Without ZC interest, any EPOLLERR (alone or with IN/OUT) is a
+	 * real socket error — destroy immediately. Treating it as a ZC
+	 * wake (rearm + write_resume) leaves CLOSE|ADDED_SEND|IOQ_WRITING
+	 * stuck, storms failed rearms, and corrupts the work-pool
+	 * (NULL fun / TAILQ_REMOVE UAF). Real TCP errors often arrive as
+	 * ERR|IN or ERR|OUT, not ERR-only.
+	 *
+	 * With ZC: drain before IN/OUT. Never write_resume inside drain —
+	 * resume only after we know whether a SEND task will own xioq_send.
+	 * EPOLLONESHOT is consumed by any delivered event; rearm when no
+	 * RECV/SEND task will do it.
+	 */
+	if (ev->events & EPOLLERR) {
+		if (!svc_zc_errqueue_active(&rec->xprt)) {
+			__warnx(TIRPC_DEBUG_FLAG_EVENT,
+				"%s: %p fd %d EPOLLERR without ZC (ev %08x); destroying",
+				__func__, &rec->xprt, rec->xprt.xp_fd,
+				ev->events);
+			SVC_DESTROY(&rec->xprt);
+			SVC_RELEASE(&rec->xprt, SVC_RELEASE_FLAG_NONE);
+			return NULL;
+		}
+		svc_zc_drain(&rec->xprt, false, false);
+	}
+
 	if (ev->events & EPOLLIN) {
 		/* This is a RECV event */
 		ev_flag = SVC_XPRT_FLAG_ADDED_RECV;
@@ -1616,6 +1700,46 @@ tls_dpr:
 		ev_flag = SVC_XPRT_FLAG_ADDED_SEND;
 		ioq = rec->ev_u.epoll.xioq_send;
 		fun = svc_rqst_xprt_task_send;
+		if (unlikely(ioq == NULL)) {
+			__warnx(TIRPC_DEBUG_FLAG_ERROR,
+				"%s: %p fd %d EPOLLOUT with NULL xioq_send",
+				__func__, &rec->xprt, rec->xprt.xp_fd);
+			/*
+			 * Completions may have freed skbuffs; SEND oneshot is
+			 * still consumed. Kick writes — no SEND task to run.
+			 */
+			if (ev->events & EPOLLERR)
+				svc_ioq_write_resume(&rec->xprt);
+			SVC_RELEASE(&rec->xprt, SVC_RELEASE_FLAG_NONE);
+			return NULL;
+		}
+	} else if (ev->events & EPOLLERR) {
+		/*
+		 * ZC ERR-only: EPOLLONESHOT disarmed only the fd that
+		 * reported the event (RECV xp_fd vs SEND xp_fd_send). Clear
+		 * and rearm that direction alone — touching the sibling drops
+		 * a still-armed oneshot (flag clear + missed EPOLLIN) and
+		 * hangs fio under MSG_ZEROCOPY. SEND is edge-triggered: also
+		 * write_resume so a silent ET rearm cannot stall the writeq.
+		 */
+		uint16_t arm = svc_epoll_is_send(ev_data.data.unique_id)
+				       ? SVC_XPRT_FLAG_ADDED_SEND
+				       : SVC_XPRT_FLAG_ADDED_RECV;
+
+		xp_flags = atomic_postclear_uint16_t_bits(
+			&rec->xprt.xp_flags, arm);
+		if (xp_flags & arm) {
+			if (unlikely(svc_rqst_rearm_events(
+					&rec->xprt, arm))) {
+				__warnx(TIRPC_DEBUG_FLAG_ERROR,
+					"%s: %p fd %d ZC EPOLLERR rearm failed (flags %x)",
+					__func__, &rec->xprt,
+					rec->xprt.xp_fd, arm);
+			}
+		}
+		svc_ioq_write_resume(&rec->xprt);
+		SVC_RELEASE(&rec->xprt, SVC_RELEASE_FLAG_NONE);
+		return NULL;
 	} else {
 		XPRT_UNIQUE_AUTO_TRACEPOINT(&rec->xprt, epoll_event, TRACE_INFO,
 			"Unhandled epoll event. ev_flag: {}", ev->events);
@@ -1654,6 +1778,13 @@ tls_dpr:
 		 */
 		ioq->ioq_wpe.fun = fun;
 		ioq->rec = rec;
+		/*
+		 * SEND task will write. RECV+ERR still needs a write kick —
+		 * completions freed TX space but this task is not the writer.
+		 */
+		if ((ev->events & EPOLLERR) &&
+		    !(ev_flag & SVC_XPRT_FLAG_ADDED_SEND))
+			svc_ioq_write_resume(&rec->xprt);
 		return ioq;
 	}
 	XPRT_UNIQUE_AUTO_TRACEPOINT(&rec->xprt, epoll_event, TRACE_INFO,
@@ -1681,6 +1812,12 @@ tls_dpr:
 		__func__, &rec->xprt, rec->xprt.xp_fd, xp_flags, xprt->xp_flags,
 		ev_flag, xprt->xp_refcnt);
 	}
+	/*
+	 * Cleared ADDED_* and did not schedule a task. If ERR freed skbuffs,
+	 * resume writes — otherwise a blocked SEND stalls forever (ET).
+	 */
+	if (ev->events & EPOLLERR)
+		svc_ioq_write_resume(&rec->xprt);
 	SVC_RELEASE(&rec->xprt, SVC_RELEASE_FLAG_NONE);
 	return (NULL);
 }
@@ -1823,7 +1960,19 @@ static void svc_rqst_epoll_loop(struct work_pool_entry *wpe)
 							epoll_ready_ns;
 				}
 				/* use this hot thread for the first event */
-				ioq->ioq_wpe.fun(&ioq->ioq_wpe);
+				if (unlikely(ioq->ioq_wpe.fun == NULL)) {
+					__warnx(TIRPC_DEBUG_FLAG_ERROR,
+						"%s: sr_rec %p ioq %p NULL ioq_wpe.fun",
+						__func__, sr_rec, ioq);
+					atomic_clear_uint16_t_bits(
+						&ioq->ioq_s.qflags,
+						IOQ_FLAG_WORKING);
+					if (ioq->rec)
+						SVC_RELEASE(&ioq->rec->xprt,
+							    SVC_RELEASE_FLAG_NONE);
+				} else {
+					ioq->ioq_wpe.fun(&ioq->ioq_wpe);
+				}
 
 				/* failsafe idle processing after work task */
 				if (atomic_postclear_uint32_t_bits(

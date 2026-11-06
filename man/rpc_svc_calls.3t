@@ -59,6 +59,13 @@ This routine returns
 for success,
 .Dv XPRT_DIED
 or greater otherwise.
+.Pp
+Large TCP replies may be transmitted with
+.Dv MSG_ZEROCOPY
+when socket TX zerocopy is enabled; see
+.Xr rpc_svc_zerocopy 3 .
+Gifted reply buffers must remain valid until ntirpc releases the send ioq
+after kernel completion.
 .El
 .Sh SEE ALSO
 .Xr poll 2 ,
@@ -66,4 +73,5 @@ or greater otherwise.
 .Xr rpc 3 ,
 .Xr rpc_svc_create 3 ,
 .Xr rpc_svc_err 3 ,
-.Xr rpc_svc_reg 3
+.Xr rpc_svc_reg 3 ,
+.Xr rpc_svc_zerocopy 3

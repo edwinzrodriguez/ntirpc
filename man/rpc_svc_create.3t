@@ -307,10 +307,19 @@ should be open and bound.
 The server is not registered with the
 .Xr rpcbind 8
 service.
+.Pp
+On Linux, when socket TX zerocopy is enabled via
+.Fn svc_init
+.Pq see Xr rpc_svc_zerocopy 3 ,
+accepted TCP connections may have
+.Dv SO_ZEROCOPY
+set so large replies can use
+.Dv MSG_ZEROCOPY .
 .El
 .Sh SEE ALSO
 .Xr rpc 3 ,
 .Xr rpc_svc_calls 3 ,
 .Xr rpc_svc_err 3 ,
 .Xr rpc_svc_reg 3 ,
+.Xr rpc_svc_zerocopy 3 ,
 .Xr rpcbind 8
